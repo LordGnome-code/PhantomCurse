@@ -76,7 +76,7 @@ local CLASS_SPELLS = {
 }
 
 local TYPE_IDS = { Magic = 1, Curse = 2, Disease = 3, Poison = 4 }
-local N_LAYERS = 12
+local N_LAYERS = 16
 
 local CLICKS = {
     { prefix = "",       suffix = "1", label = "Left click" },
@@ -93,6 +93,7 @@ local DEFAULTS = {
     classColors = true,
     pulse = true,
     hidden = false,
+    allTypes = false,          -- highlight every typed debuff, removable or not
     onlyAfflicted = false,     -- display mode: names only when removable
     scale = 1,
     alpha = 0.85,
@@ -237,6 +238,15 @@ header:SetScript("OnLeave", function() GameTooltip:Hide() end)
 ---------------------------------------------------------------------------
 -- Debuff detection
 ---------------------------------------------------------------------------
+-- Is this debuff type one to highlight? If no dispel spell could be detected
+-- the addon can't know what you remove, so it falls back to all four types.
+local function Removable(dtype)
+    if not TYPE_IDS[dtype] then return false end
+    return db.allTypes or next(canDispel) == nil or canDispel[dtype] or false
+end
+
+local TYPE_ORDER = { "Magic", "Curse", "Disease", "Poison" }
+
 -- mask = true makes every type you cannot remove fully transparent, so a
 -- texture coloured through the curve only shows for removable debuffs. This
 -- is how the highlight works in combat, when the type itself is unreadable.
@@ -249,10 +259,10 @@ local function MakeCurve(mask)
         end
         local other = mask and 0 or 1
         cv:AddPoint(0, CreateColor(1.0, 0.1, 0.1, other))       -- no type
-        for dtype, id in pairs(TYPE_IDS) do
+        for _, dtype in ipairs(TYPE_ORDER) do
             local col = TYPE_COLORS[dtype]
-            local a = (not mask or canDispel[dtype]) and 1 or 0
-            cv:AddPoint(id, CreateColor(col[1], col[2], col[3], a))
+            local a = (not mask or Removable(dtype)) and 1 or 0
+            cv:AddPoint(TYPE_IDS[dtype], CreateColor(col[1], col[2], col[3], a))
         end
         cv:AddPoint(5, CreateColor(1.0, 0.1, 0.1, other))       -- anything else
         return cv
@@ -279,7 +289,7 @@ local function FindDispellable(unit)
             local aura = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
             if not aura then return nil end
             local dtype = aura.dispelName
-            if dtype and not issecret(dtype) and canDispel[dtype] then
+            if dtype and not issecret(dtype) and Removable(dtype) then
                 return aura
             end
         end
@@ -305,6 +315,24 @@ local function ColorGlow(tex, unit, aura)
     tex:SetVertexColor(c[1], c[2], c[3])
 end
 
+-- IDs of every debuff on the unit. IDs are never secret, so this works in
+-- combat. Tries the bulk call first, then walks the debuffs one by one.
+local function HarmfulIDs(unit)
+    if C_UnitAuras.GetUnitAuraInstanceIDs then
+        local ok, ids = pcall(C_UnitAuras.GetUnitAuraInstanceIDs, unit, "HARMFUL")
+        if ok and type(ids) == "table" and #ids > 0 then return ids, "bulk" end
+    end
+    local ids = {}
+    pcall(function()
+        for i = 1, 40 do
+            local aura = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
+            if not aura then break end
+            ids[#ids + 1] = aura.auraInstanceID
+        end
+    end)
+    return ids, "one by one"
+end
+
 local function HideLayers(b)
     for i = 1, N_LAYERS do
         b.layers[i]:Hide()
@@ -321,14 +349,14 @@ local function UpdateLayers(b, unit, text)
         return false
     end
     local n = 0
+    local ids = HarmfulIDs(unit)
     pcall(function()
-        for i = 1, N_LAYERS do
-            local aura = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
-            if not aura then break end
+        for i = 1, math.min(#ids, N_LAYERS) do
+            local id = ids[i]
             local tex, fs = b.layers[i], b.layerNames[i]
             local c
             local ok = pcall(function()
-                c = C_UnitAuras.GetAuraDispelTypeColor(unit, aura.auraInstanceID, maskCurve)
+                c = C_UnitAuras.GetAuraDispelTypeColor(unit, id, maskCurve)
                 tex:SetVertexColor(c:GetRGBA())
             end)
             tex:SetShown(ok)
@@ -598,6 +626,7 @@ end
 local function ApplySettings()
     -- In "only when removable" mode the window body is see-through and only
     -- the title bar keeps a background.
+    BuildCurves()
     local compact = db.onlyAfflicted
     frame:SetBackdropColor(0.05, 0.03, 0.08, compact and 0 or (db.alpha or 0.85))
     frame:SetBackdropBorderColor(0.45, 0.30, 0.75, compact and 0 or 1)
@@ -633,7 +662,7 @@ end
 ---------------------------------------------------------------------------
 local function BuildSettings()
     local f = CreateFrame("Frame", "PhantomCurseSettings", UIParent, "BackdropTemplate")
-    f:SetSize(250, 420)
+    f:SetSize(250, 444)
     f:SetPoint("CENTER")
     f:SetFrameStrata("DIALOG")
     f:SetClampedToScreen(true)
@@ -692,6 +721,7 @@ local function BuildSettings()
     Check("Alert sound", "sound")
     Check("Pulse the highlight", "pulse")
     Check("Class-coloured names", "classColors")
+    Check("Highlight all debuff types", "allTypes")
 
     y = y - 6
     local ml = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
@@ -855,6 +885,13 @@ local function Debug()
         .. " | colour curve " .. (curve and "ok" or "missing")
         .. " | mask curve " .. (maskCurve and "ok" or "missing")
         .. " | in combat: " .. tostring(InCombatLockdown() and true or false))
+    local shown = {}
+    for _, t in ipairs(TYPE_ORDER) do
+        if Removable(t) then shown[#shown + 1] = t end
+    end
+    local ids, how = HarmfulIDs("player")
+    Print("highlighting types: " .. table.concat(shown, ", ")
+        .. " | debuffs the addon can see on you: " .. #ids .. " (" .. how .. ")")
     local okF, hit = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
     Print("game says you have something you can remove: " .. ((okF and hit) and "yes" or "no"))
     local count = 0
@@ -956,6 +993,11 @@ events:SetScript("OnEvent", function(_, event, arg1)
         filterOK = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
         CreateButtons()
         ApplySettings()
+
+        -- Safety net in case an aura change arrives without an event.
+        C_Timer.NewTicker(0.5, function()
+            if frame:IsShown() then UpdateAll() end
+        end)
 
         SafeRegister("UNIT_AURA")
         SafeRegister("GROUP_ROSTER_UPDATE")
