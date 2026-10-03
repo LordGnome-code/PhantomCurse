@@ -29,49 +29,54 @@ local TYPE_COLORS = {
 }
 local DEFAULT_COLOR = { 1.00, 0.10, 0.10 }
 
--- Candidate dispels per class: spell ID and the debuff types it removes.
--- Whichever ones your character actually knows are used, in this order:
+-- Candidate dispels per class: spell ID, English name, and the debuff types
+-- it removes. A spell counts as known if either the ID or the name is found
+-- in your spellbook. Whichever ones you know are used, in this order:
 -- left click, right click, middle click, shift+left click.
 local CLASS_SPELLS = {
     PRIEST = {
-        { 527,    "Magic" },                        -- Dispel Magic / Purify
-        { 528,    "Disease" },                      -- Cure Disease
-        { 552,    "Disease" },                      -- Abolish Disease
-        { 213634, "Disease" },                      -- Purify Disease
+        { 527,    "Dispel Magic",       "Magic" },
+        { 528,    "Cure Disease",       "Disease" },
+        { 552,    "Abolish Disease",    "Disease" },
+        { 213634, "Purify Disease",     "Disease" },
     },
     PALADIN = {
-        { 4987,   "Magic", "Poison", "Disease" },   -- Cleanse
-        { 1152,   "Poison", "Disease" },            -- Purify
-        { 213644, "Poison", "Disease" },            -- Cleanse Toxins
+        { 4987,   "Cleanse",            "Magic", "Poison", "Disease" },
+        { 1152,   "Purify",             "Poison", "Disease" },
+        { 213644, "Cleanse Toxins",     "Poison", "Disease" },
     },
     DRUID = {
-        { 88423,  "Magic", "Curse", "Poison" },     -- Nature's Cure
-        { 2782,   "Curse" },                        -- Remove Curse
-        { 2893,   "Poison" },                       -- Abolish Poison
-        { 8946,   "Poison" },                       -- Cure Poison
+        { 88423,  "Nature's Cure",      "Magic", "Curse", "Poison" },
+        { 2782,   "Remove Curse",       "Curse" },
+        { 2893,   "Abolish Poison",     "Poison" },
+        { 8946,   "Cure Poison",        "Poison" },
     },
     SHAMAN = {
-        { 77130,  "Magic", "Curse" },               -- Purify Spirit
-        { 51886,  "Curse" },                        -- Cleanse Spirit
-        { 526,    "Poison" },                       -- Cure Poison
-        { 2870,   "Disease" },                      -- Cure Disease
+        { 77130,  "Purify Spirit",      "Magic", "Curse" },
+        { 51886,  "Cleanse Spirit",     "Curse" },
+        { 526,    "Cure Poison",        "Poison" },
+        { 2870,   "Cure Disease",       "Disease" },
     },
     MAGE = {
-        { 475,    "Curse" },                        -- Remove (Lesser) Curse
+        { 475,    "Remove Lesser Curse", "Curse" },
+        { 0,      "Remove Curse",       "Curse" },
     },
     MONK = {
-        { 115450, "Magic", "Poison", "Disease" },   -- Detox (healer)
-        { 218164, "Poison", "Disease" },            -- Detox
+        { 115450, "Detox",              "Magic", "Poison", "Disease" },
+        { 218164, "Detox",              "Poison", "Disease" },
     },
     EVOKER = {
-        { 360823, "Magic", "Poison" },              -- Naturalize
-        { 365585, "Poison" },                       -- Expunge
-        { 374251, "Curse", "Poison", "Disease" },   -- Cauterizing Flame
+        { 360823, "Naturalize",         "Magic", "Poison" },
+        { 365585, "Expunge",            "Poison" },
+        { 374251, "Cauterizing Flame",  "Curse", "Poison", "Disease" },
     },
     WARLOCK = {
-        { 89808,  "Magic" },                        -- Singe Magic (pet)
+        { 89808,  "Singe Magic",        "Magic" },
     },
 }
+
+local TYPE_IDS = { Magic = 1, Curse = 2, Disease = 3, Poison = 4 }
+local N_LAYERS = 12
 
 local CLICKS = {
     { prefix = "",       suffix = "1", label = "Left click" },
@@ -100,7 +105,8 @@ local activeSpells = {}
 local canDispel = {}           -- debuff types your known spells remove
 local pending = false          -- secure work postponed until combat ends
 local lastSound = 0
-local curve
+local curve                    -- debuff type -> colour
+local maskCurve                -- same, but invisible for types you can't remove
 local settings                 -- options window, built on first use
 
 local function Print(msg)
@@ -137,17 +143,32 @@ local function SpellName(id)
     end
 end
 
+local function KnownByName(name)
+    if C_Spell and C_Spell.GetSpellInfo then
+        local ok, info = pcall(C_Spell.GetSpellInfo, name)
+        return ok and info ~= nil
+    elseif GetSpellInfo then
+        return GetSpellInfo(name) ~= nil
+    end
+    return false
+end
+
 local function FindSpells()
     local found, seen = {}, {}
     wipe(canDispel)
     local _, class = UnitClass("player")
     for _, entry in ipairs(CLASS_SPELLS[class] or {}) do
-        if IsKnown(entry[1]) then
-            for i = 2, #entry do canDispel[entry[i]] = true end
-            local name = SpellName(entry[1])
-            if name and not seen[name] and #found < #CLICKS then
-                seen[name] = true
-                found[#found + 1] = name
+        local castName
+        if entry[1] > 0 and IsKnown(entry[1]) then
+            castName = SpellName(entry[1]) or entry[2]
+        elseif KnownByName(entry[2]) then
+            castName = entry[2]
+        end
+        if castName then
+            for i = 3, #entry do canDispel[entry[i]] = true end
+            if not seen[castName] and #found < #CLICKS then
+                seen[castName] = true
+                found[#found + 1] = castName
             end
         end
     end
@@ -210,22 +231,32 @@ header:SetScript("OnLeave", function() GameTooltip:Hide() end)
 ---------------------------------------------------------------------------
 -- Debuff detection
 ---------------------------------------------------------------------------
-local function BuildCurve()
+-- mask = true makes every type you cannot remove fully transparent, so a
+-- texture coloured through the curve only shows for removable debuffs. This
+-- is how the highlight works in combat, when the type itself is unreadable.
+local function MakeCurve(mask)
     if not (C_CurveUtil and C_CurveUtil.CreateColorCurve and CreateColor) then return end
     local ok, c = pcall(function()
         local cv = C_CurveUtil.CreateColorCurve()
         if Enum and Enum.LuaCurveType and Enum.LuaCurveType.Step then
             cv:SetType(Enum.LuaCurveType.Step)
         end
-        cv:AddPoint(0, CreateColor(1.0, 0.1, 0.1, 1))  -- none
-        cv:AddPoint(1, CreateColor(0.2, 0.6, 1.0, 1))  -- magic
-        cv:AddPoint(2, CreateColor(0.6, 0.0, 1.0, 1))  -- curse
-        cv:AddPoint(3, CreateColor(0.6, 0.4, 0.0, 1))  -- disease
-        cv:AddPoint(4, CreateColor(0.0, 0.6, 0.0, 1))  -- poison
-        cv:AddPoint(5, CreateColor(1.0, 0.1, 0.1, 1))  -- anything else
+        local other = mask and 0 or 1
+        cv:AddPoint(0, CreateColor(1.0, 0.1, 0.1, other))       -- no type
+        for dtype, id in pairs(TYPE_IDS) do
+            local col = TYPE_COLORS[dtype]
+            local a = (not mask or canDispel[dtype]) and 1 or 0
+            cv:AddPoint(id, CreateColor(col[1], col[2], col[3], a))
+        end
+        cv:AddPoint(5, CreateColor(1.0, 0.1, 0.1, other))       -- anything else
         return cv
     end)
-    if ok then curve = c end
+    if ok then return c end
+end
+
+local function BuildCurves()
+    curve = curve or MakeCurve(false)
+    maskCurve = MakeCurve(true)
 end
 
 -- Returns a debuff on the unit that your class can remove, or nil.
@@ -268,28 +299,52 @@ local function ColorGlow(tex, unit, aura)
     tex:SetVertexColor(c[1], c[2], c[3])
 end
 
-local function SetHighlight(b, on)
-    if on then
-        b.glow:Show()
-        for _, e in ipairs(b.edges) do e:Show() end
-        if db.pulse then
-            if not b.pulse:IsPlaying() then b.pulse:Play() end
-        else
-            b.pulse:Stop()
-            b.glow:SetAlpha(0.85)
-        end
-    else
-        b.pulse:Stop()
-        b.glow:Hide()
-        for _, e in ipairs(b.edges) do e:Hide() end
+local function HideLayers(b)
+    for i = 1, N_LAYERS do b.layers[i]:Hide() end
+end
+
+-- One texture per debuff, coloured through the mask curve: removable types
+-- show in their colour, everything else is transparent. Nothing is read here,
+-- so it keeps working when aura details are secret.
+local function UpdateLayers(b, unit)
+    if not (maskCurve and C_UnitAuras.GetAuraDispelTypeColor) then
+        HideLayers(b)
+        return false
     end
+    local n = 0
+    pcall(function()
+        for i = 1, N_LAYERS do
+            local aura = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
+            if not aura then break end
+            local tex = b.layers[i]
+            local ok = pcall(function()
+                local c = C_UnitAuras.GetAuraDispelTypeColor(unit, aura.auraInstanceID, maskCurve)
+                tex:SetVertexColor(c:GetRGBA())
+            end)
+            tex:SetShown(ok)
+            n = i
+        end
+    end)
+    for i = n + 1, N_LAYERS do b.layers[i]:Hide() end
+    return n > 0
+end
+
+local function SetEdges(b, on)
+    for _, e in ipairs(b.edges) do e:SetShown(on) end
+end
+
+local function ClearHighlight(b)
+    b.afflicted = false
+    b.pulse:Stop()
+    b.glow:Hide()
+    SetEdges(b, false)
+    HideLayers(b)
 end
 
 local function UpdateButton(b)
     local unit = b.unit
     if not UnitExists(unit) then
-        b.afflicted = false
-        SetHighlight(b, false)
+        ClearHighlight(b)
         return
     end
 
@@ -297,10 +352,14 @@ local function UpdateButton(b)
 
     local aura = FindDispellable(unit)
     local testing = b.testUntil and GetTime() < b.testUntil
+    local detected = aura or testing
+    local layered = false
 
-    if aura or testing then
+    if detected then
+        HideLayers(b)
         ColorGlow(b.glow, unit, aura)
-        SetHighlight(b, true)
+        b.glow:Show()
+        SetEdges(b, true)
         b.name:SetTextColor(1, 1, 1)
         if not b.afflicted then
             b.afflicted = true
@@ -311,7 +370,9 @@ local function UpdateButton(b)
         end
     else
         b.afflicted = false
-        SetHighlight(b, false)
+        b.glow:Hide()
+        SetEdges(b, false)
+        layered = UpdateLayers(b, unit)
         local _, class = UnitClass(unit)
         local cc = db.classColors and class and not issecret(class)
             and RAID_CLASS_COLORS and RAID_CLASS_COLORS[class]
@@ -320,6 +381,12 @@ local function UpdateButton(b)
         else
             b.name:SetTextColor(0.9, 0.9, 0.9)
         end
+    end
+
+    if (detected or layered) and db.pulse then
+        if not b.pulse:IsPlaying() then b.pulse:Play() end
+    else
+        b.pulse:Stop()
     end
 end
 
@@ -341,25 +408,45 @@ local function CreateUnitButton(unit, visibility)
     bg:SetAllPoints()
     bg:SetColorTexture(0.12, 0.10, 0.16, 0.9)
 
-    -- Highlight: coloured fill that pulses, plus a bright outline.
-    local glow = b:CreateTexture(nil, "BORDER")
+    -- Highlight: coloured fill that pulses, plus a bright outline. The fill
+    -- lives in its own frame so the whole thing can pulse together.
+    local hlf = CreateFrame("Frame", nil, b)
+    hlf:SetAllPoints()
+    hlf:SetFrameLevel(b:GetFrameLevel() + 1)
+
+    local glow = hlf:CreateTexture(nil, "BORDER")
     glow:SetAllPoints()
     glow:SetTexture("Interface\\Buttons\\WHITE8x8")
     glow:SetAlpha(0.85)
     glow:Hide()
     b.glow = glow
 
-    local pulse = glow:CreateAnimationGroup()
+    b.layers = {}
+    for i = 1, N_LAYERS do
+        local l = hlf:CreateTexture(nil, "BORDER")
+        l:SetAllPoints()
+        l:SetTexture("Interface\\Buttons\\WHITE8x8")
+        l:SetAlpha(0.85)
+        l:Hide()
+        b.layers[i] = l
+    end
+
+    local pulse = hlf:CreateAnimationGroup()
     local fade = pulse:CreateAnimation("Alpha")
-    fade:SetFromAlpha(0.9)
-    fade:SetToAlpha(0.35)
+    fade:SetFromAlpha(1)
+    fade:SetToAlpha(0.4)
     fade:SetDuration(0.45)
     pulse:SetLooping("BOUNCE")
     b.pulse = pulse
 
+    -- Text and outline sit above the fill.
+    local top = CreateFrame("Frame", nil, b)
+    top:SetAllPoints()
+    top:SetFrameLevel(b:GetFrameLevel() + 2)
+
     b.edges = {}
     for i = 1, 4 do
-        local e = b:CreateTexture(nil, "ARTWORK")
+        local e = top:CreateTexture(nil, "ARTWORK")
         e:SetColorTexture(1, 1, 1, 0.9)
         e:Hide()
         b.edges[i] = e
@@ -373,7 +460,7 @@ local function CreateUnitButton(unit, visibility)
     hl:SetAllPoints()
     hl:SetColorTexture(1, 1, 1, 0.15)
 
-    local name = b:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    local name = top:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     name:SetPoint("LEFT", 4, 0)
     name:SetPoint("RIGHT", -4, 0)
     name:SetJustifyH("LEFT")
@@ -412,6 +499,7 @@ end
 
 local function ApplySpells()
     activeSpells = FindSpells()
+    BuildCurves()
     for _, b in ipairs(buttons) do
         for i, click in ipairs(CLICKS) do
             local name = activeSpells[i]
@@ -692,6 +780,34 @@ cog:SetScript("OnLeave", function() GameTooltip:Hide() end)
 ---------------------------------------------------------------------------
 -- Slash commands
 ---------------------------------------------------------------------------
+local function Debug()
+    local _, class = UnitClass("player")
+    local types = {}
+    for t in pairs(canDispel) do types[#types + 1] = t end
+    Print("class " .. tostring(class)
+        .. " | spells: " .. (#activeSpells > 0 and table.concat(activeSpells, ", ") or "NONE FOUND")
+        .. " | removes: " .. (#types > 0 and table.concat(types, ", ") or "nothing"))
+    Print("game filter " .. (filterOK and "ok" or "rejected")
+        .. " | colour curve " .. (curve and "ok" or "missing")
+        .. " | mask curve " .. (maskCurve and "ok" or "missing")
+        .. " | in combat: " .. tostring(InCombatLockdown() and true or false))
+    local okF, hit = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
+    Print("game says you have something you can remove: " .. ((okF and hit) and "yes" or "no"))
+    local count = 0
+    pcall(function()
+        for i = 1, 40 do
+            local a = C_UnitAuras.GetAuraDataByIndex("player", i, "HARMFUL")
+            if not a then break end
+            count = i
+            local n, d = a.name, a.dispelName
+            if issecret(n) then n = "(secret)" end
+            if issecret(d) then d = "(secret)" elseif d == nil or d == "" then d = "no type" end
+            Print("  debuff " .. i .. ": " .. tostring(n) .. " - " .. tostring(d))
+        end
+    end)
+    if count == 0 then Print("  no debuffs on you right now.") end
+end
+
 local function SetHidden(hidden)
     db.hidden = hidden
     SecureRefresh()
@@ -726,6 +842,8 @@ SlashCmdList.PHANTOMCURSE = function(msg)
         ResetPosition()
     elseif msg == "test" then
         TestHighlight()
+    elseif msg == "debug" then
+        Debug()
     elseif msg == "spells" then
         if #activeSpells == 0 then
             Print("no dispel spell found for your class.")
@@ -735,7 +853,7 @@ SlashCmdList.PHANTOMCURSE = function(msg)
             end
         end
     else
-        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | reset | test | spells")
+        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | reset | test | spells | debug")
     end
 end
 
@@ -767,7 +885,6 @@ events:SetScript("OnEvent", function(_, event, arg1)
     elseif event == "PLAYER_LOGIN" then
         -- Skip the client-side filter if this client rejects it.
         filterOK = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
-        BuildCurve()
         CreateButtons()
         ApplySettings()
 
