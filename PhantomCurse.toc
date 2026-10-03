@@ -1,0 +1,8 @@
+## Interface: 16001, 120007
+## Title: PhantomCurse
+## Notes: Click a name to cleanse it. A small decurse window for healers.
+## Author: You
+## Version: 1.0.0
+## SavedVariables: PhantomCurseDB
+
+PhantomCurse.lua
