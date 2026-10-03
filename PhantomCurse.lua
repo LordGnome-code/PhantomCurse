@@ -93,6 +93,7 @@ local DEFAULTS = {
     classColors = true,
     pulse = true,
     hidden = false,
+    onlyAfflicted = false,     -- display mode: names only when removable
     scale = 1,
     alpha = 0.85,
 }
@@ -198,6 +199,11 @@ header:SetHeight(HEADER_H)
 header:EnableMouse(true)
 header:RegisterForDrag("LeftButton")
 
+header.bg = header:CreateTexture(nil, "BACKGROUND")
+header.bg:SetAllPoints()
+header.bg:SetColorTexture(0.05, 0.03, 0.08, 0.85)
+header.bg:Hide()
+
 local title = header:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 title:SetPoint("LEFT", 5, 0)
 title:SetText("PhantomCurse")
@@ -300,13 +306,16 @@ local function ColorGlow(tex, unit, aura)
 end
 
 local function HideLayers(b)
-    for i = 1, N_LAYERS do b.layers[i]:Hide() end
+    for i = 1, N_LAYERS do
+        b.layers[i]:Hide()
+        b.layerNames[i]:Hide()
+    end
 end
 
 -- One texture per debuff, coloured through the mask curve: removable types
 -- show in their colour, everything else is transparent. Nothing is read here,
 -- so it keeps working when aura details are secret.
-local function UpdateLayers(b, unit)
+local function UpdateLayers(b, unit, text)
     if not (maskCurve and C_UnitAuras.GetAuraDispelTypeColor) then
         HideLayers(b)
         return false
@@ -316,16 +325,28 @@ local function UpdateLayers(b, unit)
         for i = 1, N_LAYERS do
             local aura = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
             if not aura then break end
-            local tex = b.layers[i]
+            local tex, fs = b.layers[i], b.layerNames[i]
+            local c
             local ok = pcall(function()
-                local c = C_UnitAuras.GetAuraDispelTypeColor(unit, aura.auraInstanceID, maskCurve)
+                c = C_UnitAuras.GetAuraDispelTypeColor(unit, aura.auraInstanceID, maskCurve)
                 tex:SetVertexColor(c:GetRGBA())
             end)
             tex:SetShown(ok)
+            -- "Only when removable" mode: a copy of the name whose visibility
+            -- follows the same hidden value as the fill.
+            local okName = ok and db.onlyAfflicted and pcall(function()
+                local _, _, _, a = c:GetRGBA()
+                fs:SetText(text)
+                fs:SetVertexColor(1, 1, 1, a)
+            end)
+            fs:SetShown(okName and true or false)
             n = i
         end
     end)
-    for i = n + 1, N_LAYERS do b.layers[i]:Hide() end
+    for i = n + 1, N_LAYERS do
+        b.layers[i]:Hide()
+        b.layerNames[i]:Hide()
+    end
     return n > 0
 end
 
@@ -348,7 +369,8 @@ local function UpdateButton(b)
         return
     end
 
-    b.name:SetText(GetUnitName(unit, false) or unit)
+    local text = GetUnitName(unit, false) or unit
+    b.name:SetText(text)
 
     local aura = FindDispellable(unit)
     local testing = b.testUntil and GetTime() < b.testUntil
@@ -372,7 +394,7 @@ local function UpdateButton(b)
         b.afflicted = false
         b.glow:Hide()
         SetEdges(b, false)
-        layered = UpdateLayers(b, unit)
+        layered = UpdateLayers(b, unit, text)
         local _, class = UnitClass(unit)
         local cc = db.classColors and class and not issecret(class)
             and RAID_CLASS_COLORS and RAID_CLASS_COLORS[class]
@@ -382,6 +404,11 @@ local function UpdateButton(b)
             b.name:SetTextColor(0.9, 0.9, 0.9)
         end
     end
+
+    -- Display mode: in "only when removable" the row is blank unless afflicted.
+    local showRow = detected or not db.onlyAfflicted
+    b.bg:SetShown(showRow and true or false)
+    b.name:SetShown(showRow and true or false)
 
     if (detected or layered) and db.pulse then
         if not b.pulse:IsPlaying() then b.pulse:Play() end
@@ -407,6 +434,7 @@ local function CreateUnitButton(unit, visibility)
     local bg = b:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints()
     bg:SetColorTexture(0.12, 0.10, 0.16, 0.9)
+    b.bg = bg
 
     -- Highlight: coloured fill that pulses, plus a bright outline. The fill
     -- lives in its own frame so the whole thing can pulse together.
@@ -443,6 +471,17 @@ local function CreateUnitButton(unit, visibility)
     local top = CreateFrame("Frame", nil, b)
     top:SetAllPoints()
     top:SetFrameLevel(b:GetFrameLevel() + 2)
+
+    b.layerNames = {}
+    for i = 1, N_LAYERS do
+        local fs = top:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        fs:SetPoint("LEFT", 4, 0)
+        fs:SetPoint("RIGHT", -4, 0)
+        fs:SetJustifyH("LEFT")
+        fs:SetWordWrap(false)
+        fs:Hide()
+        b.layerNames[i] = fs
+    end
 
     b.edges = {}
     for i = 1, 4 do
@@ -557,7 +596,12 @@ local function SecureRefresh()
 end
 
 local function ApplySettings()
-    frame:SetBackdropColor(0.05, 0.03, 0.08, db.alpha or 0.85)
+    -- In "only when removable" mode the window body is see-through and only
+    -- the title bar keeps a background.
+    local compact = db.onlyAfflicted
+    frame:SetBackdropColor(0.05, 0.03, 0.08, compact and 0 or (db.alpha or 0.85))
+    frame:SetBackdropBorderColor(0.45, 0.30, 0.75, compact and 0 or 1)
+    header.bg:SetShown(compact and true or false)
     UpdateAll()
     SecureRefresh()
 end
@@ -589,7 +633,7 @@ end
 ---------------------------------------------------------------------------
 local function BuildSettings()
     local f = CreateFrame("Frame", "PhantomCurseSettings", UIParent, "BackdropTemplate")
-    f:SetSize(250, 372)
+    f:SetSize(250, 420)
     f:SetPoint("CENTER")
     f:SetFrameStrata("DIALOG")
     f:SetClampedToScreen(true)
@@ -648,6 +692,25 @@ local function BuildSettings()
     Check("Alert sound", "sound")
     Check("Pulse the highlight", "pulse")
     Check("Class-coloured names", "classColors")
+
+    y = y - 6
+    local ml = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    ml:SetPoint("TOPLEFT", 14, y)
+    ml:SetText("Display mode (click to change):")
+    y = y - 16
+    local mode = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    mode:SetSize(222, 22)
+    mode:SetPoint("TOPLEFT", 12, y)
+    mode.Refresh = function()
+        mode:SetText(db.onlyAfflicted and "Names only when removable" or "Names always shown")
+    end
+    mode:SetScript("OnClick", function()
+        db.onlyAfflicted = not db.onlyAfflicted
+        mode.Refresh()
+        ApplySettings()
+    end)
+    f.mode = mode
+    y = y - 24
 
     f.sliders = {}
     local function Slider(label, key, minV, maxV, step, fmt)
@@ -710,6 +773,7 @@ local function BuildSettings()
     note:SetText("Show/hide and scale changes made in combat apply when combat ends.")
 
     f:SetScript("OnShow", function()
+        f.mode.Refresh()
         for _, cb in ipairs(f.checks) do
             local v = db[cb.key] and true or false
             if cb.invert then v = not v end
@@ -842,6 +906,11 @@ SlashCmdList.PHANTOMCURSE = function(msg)
         ResetPosition()
     elseif msg == "test" then
         TestHighlight()
+    elseif msg == "mode" then
+        db.onlyAfflicted = not db.onlyAfflicted
+        ApplySettings()
+        if settings then settings.mode.Refresh() end
+        Print("display mode: " .. (db.onlyAfflicted and "names only when removable." or "names always shown."))
     elseif msg == "debug" then
         Debug()
     elseif msg == "spells" then
@@ -853,7 +922,7 @@ SlashCmdList.PHANTOMCURSE = function(msg)
             end
         end
     else
-        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | reset | test | spells | debug")
+        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | test | spells | debug")
     end
 end
 
