@@ -7,10 +7,15 @@
 --    shows/hides them through visibility state drivers.
 --  * The window's own visibility (closed, hide out of combat, hide when solo)
 --    is also a state driver, so it can appear the instant combat starts.
---  * Aura details are "secret values" in combat, so addon code cannot read a
---    debuff's type. Instead the client is asked "does this unit have a debuff
---    I can dispel?" through an aura filter, and the debuff type colour is
---    passed straight to the texture without being inspected.
+--  * In combat the client hides all aura data from addon code ("secret
+--    values"), so an addon cannot see who has which debuff. The highlight is
+--    therefore drawn by the game itself: every row holds an AuraContainer
+--    with one aura slot that only accepts debuffs of the types your dispel
+--    removes. The game shows that slot the moment a matching debuff lands
+--    and hides it when it is gone, in or out of combat.
+--  * Addon-side detection (reading debuff types directly) still runs out of
+--    combat for the alert sound, and as a fallback on clients without
+--    AuraContainer.
 
 local ADDON = ...
 
@@ -110,6 +115,8 @@ local lastSound = 0
 local curve                    -- debuff type -> colour
 local maskCurve                -- same, but invisible for types you can't remove
 local settings                 -- options window, built on first use
+local useContainers = true     -- game-drawn highlight available?
+local containerError           -- why not, if it isn't
 
 local function Print(msg)
     print("|cff9d7dffPhantomCurse|r: " .. msg)
@@ -402,15 +409,18 @@ local function UpdateButton(b)
 
     local aura = FindDispellable(unit)
     local testing = b.testUntil and GetTime() < b.testUntil
-    local detected = aura or testing
+    -- When the game draws the highlight, the addon only draws its own for
+    -- the "Test highlight" button.
+    local detected = testing or (not b.container and aura)
     local layered = false
 
-    if detected then
-        HideLayers(b)
-        ColorGlow(b.glow, unit, aura)
-        b.glow:Show()
-        SetEdges(b, true)
-        b.name:SetTextColor(1, 1, 1)
+    if b.auraParts and b.auraParts.name and not InCombatLockdown() then
+        pcall(b.auraParts.name.SetText, b.auraParts.name, text)
+    end
+
+    -- Alert sound: only possible while the addon itself can see the debuff,
+    -- which the game does not allow in combat.
+    if aura then
         if not b.afflicted then
             b.afflicted = true
             if db.sound and GetTime() - lastSound > 2 then
@@ -420,9 +430,18 @@ local function UpdateButton(b)
         end
     else
         b.afflicted = false
+    end
+
+    if detected then
+        HideLayers(b)
+        ColorGlow(b.glow, unit, aura)
+        b.glow:Show()
+        SetEdges(b, true)
+        b.name:SetTextColor(1, 1, 1)
+    else
         b.glow:Hide()
         SetEdges(b, false)
-        layered = UpdateLayers(b, unit, text)
+        layered = not b.container and UpdateLayers(b, unit, text)
         local _, class = UnitClass(unit)
         local cc = db.classColors and class and not issecret(class)
             and RAID_CLASS_COLORS and RAID_CLASS_COLORS[class]
@@ -452,6 +471,111 @@ end
 ---------------------------------------------------------------------------
 -- Secure unit buttons
 ---------------------------------------------------------------------------
+-- The debuff types the game-drawn highlight should react to.
+local function DispelTypeSet()
+    local set, key = {}, ""
+    for _, dtype in ipairs(TYPE_ORDER) do
+        if Removable(dtype) then
+            set[dtype] = true
+            key = key .. dtype
+        end
+    end
+    return set, key
+end
+
+-- Builds the game-drawn highlight for one row: an AuraContainer watching the
+-- row's unit, with a single aura slot that only accepts debuffs of the given
+-- dispel types. The slot's button fills the row and is shown/hidden by the
+-- game, so it works in combat. Everything drawn inside it (fill, outline,
+-- name) appears and disappears with it.
+local function AttachContainer(b)
+    local ok, err = pcall(function()
+        local c = CreateFrame("AuraContainer", nil, b, "CustomAuraContainerTemplate")
+        c:SetAllPoints(b)
+        c:SetFrameLevel(b:GetFrameLevel() + 3)
+        c:SetUnit(b.unit)
+
+        local parts = {}
+        local set, key = DispelTypeSet()
+        local styles = Enum and Enum.CustomAuraButtonDispelTypeTextureStyle
+        local preserve = styles and styles.PreserveAsset or 3
+
+        c:AddAuraSlot("dispel", "HARMFUL", {
+            candidateFilters = { includeDispelTypes = set },
+            initializeFrame = function(btn)
+                btn:ClearAllPoints()
+                btn:SetAllPoints(c)
+                pcall(btn.EnableMouse, btn, false) -- clicks must reach the row
+
+                -- Fill, tinted by the game in the debuff type's colour.
+                local fill = btn:CreateTexture(nil, "BACKGROUND")
+                fill:SetAllPoints()
+                fill:SetTexture("Interface\\Buttons\\WHITE8x8")
+                fill:SetVertexColor(1, 0.1, 0.1)
+                pcall(btn.AddDispelTypeTexture, btn, fill, { style = preserve })
+
+                for i = 1, 4 do
+                    local e = btn:CreateTexture(nil, "BORDER")
+                    e:SetColorTexture(1, 1, 1, 0.9)
+                    if i == 1 then e:SetPoint("TOPLEFT"); e:SetPoint("TOPRIGHT"); e:SetHeight(1)
+                    elseif i == 2 then e:SetPoint("BOTTOMLEFT"); e:SetPoint("BOTTOMRIGHT"); e:SetHeight(1)
+                    elseif i == 3 then e:SetPoint("TOPLEFT"); e:SetPoint("BOTTOMLEFT"); e:SetWidth(1)
+                    else e:SetPoint("TOPRIGHT"); e:SetPoint("BOTTOMRIGHT"); e:SetWidth(1) end
+                end
+
+                local fs = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+                fs:SetPoint("LEFT", 4, 0)
+                fs:SetPoint("RIGHT", -4, 0)
+                fs:SetJustifyH("LEFT")
+                fs:SetWordWrap(false)
+                parts.name = fs
+
+                local ag = fill:CreateAnimationGroup()
+                local fade = ag:CreateAnimation("Alpha")
+                fade:SetFromAlpha(1)
+                fade:SetToAlpha(0.4)
+                fade:SetDuration(0.45)
+                ag:SetLooping("BOUNCE")
+                parts.pulse = ag
+                parts.btn = btn
+            end,
+        })
+
+        b.container = c
+        b.auraParts = parts
+        b.filterKey = key
+    end)
+    if not ok then
+        b.container = nil
+        useContainers = false
+        containerError = tostring(err)
+    end
+end
+
+-- Keeps the game-drawn highlight in step with your spells and settings.
+-- Out of combat only: the game locks these frames while aura data is secret.
+local function UpdateContainers()
+    local set, key = DispelTypeSet()
+    for _, b in ipairs(buttons) do
+        if b.container then
+            if b.filterKey ~= key then
+                local ok = pcall(b.container.SetAuraSlotCandidateFilters, b.container, "dispel",
+                    { includeDispelTypes = set })
+                if ok then b.filterKey = key end
+            end
+            local parts = b.auraParts
+            if parts and parts.btn and parts.pulse and parts.pulseOn ~= db.pulse then
+                pcall(parts.btn.RemoveAuraShownAnimation, parts.btn, parts.pulse)
+                pcall(parts.pulse.Stop, parts.pulse)
+                if db.pulse then
+                    pcall(parts.btn.AddAuraShownAnimation, parts.btn, parts.pulse)
+                end
+                parts.pulseOn = db.pulse
+            end
+        end
+    end
+end
+
 local function CreateUnitButton(unit, visibility)
     local b = CreateFrame("Button", "PhantomCurseButton_" .. unit, frame, "SecureActionButtonTemplate")
     b:SetSize(BTN_W, BTN_H)
@@ -534,6 +658,8 @@ local function CreateUnitButton(unit, visibility)
     name:SetWordWrap(false)
     b.name = name
 
+    if useContainers then AttachContainer(b) end
+
     b:SetScript("OnShow", UpdateButton)
     RegisterStateDriver(b, "visibility", visibility)
 
@@ -607,6 +733,7 @@ local function ApplyVisibility()
             driver = "[" .. table.concat(conds, ",") .. "] show; hide"
         end
     end
+    frame:SetAlpha(1)
     RegisterStateDriver(frame, "visibility", driver)
 end
 
@@ -618,6 +745,7 @@ local function SecureRefresh()
     end
     pending = false
     ApplySpells()
+    UpdateContainers()
     ResizeWindow()
     frame:SetScale(db.scale or 1)
     ApplyVisibility()
@@ -649,7 +777,9 @@ local function TestHighlight()
     local b = byUnit[IsInRaid() and "raid1" or "player"]
     if not b then return end
     b.testUntil = GetTime() + 5
-    b.afflicted = false -- so the alert sound plays too
+    if db.sound then
+        PlaySound(SOUNDKIT and SOUNDKIT.RAID_WARNING or 8959, "Master")
+    end
     UpdateButton(b)
     C_Timer.After(5.1, UpdateAll)
     if not frame:IsShown() then
@@ -660,9 +790,19 @@ end
 ---------------------------------------------------------------------------
 -- Settings window
 ---------------------------------------------------------------------------
+local function VersionInfo()
+    local getMeta = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
+    local version = getMeta and getMeta(ADDON, "Version") or "?"
+    local game, build, _, toc = GetBuildInfo()
+    return "PhantomCurse version " .. tostring(version),
+        "Game " .. tostring(game) .. " (build " .. tostring(build) .. "), interface " .. tostring(toc),
+        useContainers and "Highlight: drawn by the game (works in combat)"
+            or "Highlight: fallback (out of combat only)"
+end
+
 local function BuildSettings()
     local f = CreateFrame("Frame", "PhantomCurseSettings", UIParent, "BackdropTemplate")
-    f:SetSize(250, 444)
+    f:SetSize(250, 490)
     f:SetPoint("CENTER")
     f:SetFrameStrata("DIALOG")
     f:SetClampedToScreen(true)
@@ -694,7 +834,12 @@ local function BuildSettings()
     xt:SetText("X")
     x:SetScript("OnClick", function() f:Hide() end)
 
-    local y = -30
+    local v1, v2, v3 = VersionInfo()
+    local info = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    info:SetPoint("TOP", 0, -26)
+    info:SetText(v1 .. "\n" .. v2 .. "\n" .. v3)
+
+    local y = -72
     f.checks = {}
     local function Check(label, key, invert)
         local cb = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
@@ -828,32 +973,36 @@ end
 ---------------------------------------------------------------------------
 -- Title bar buttons: settings cog and close
 ---------------------------------------------------------------------------
--- Close is a secure button so it can hide the window even in combat.
-local close = CreateFrame("Button", "PhantomCurseClose", frame, "SecureHandlerClickTemplate")
+-- The game does not let addons hide a window holding cast buttons during
+-- combat, so a close in combat makes it invisible and finishes afterwards.
+local close = CreateFrame("Button", nil, header)
 close:SetSize(14, 14)
 close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -2, -1)
 close:SetFrameLevel(header:GetFrameLevel() + 2)
-close:RegisterForClicks("AnyUp")
 local closeText = close:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 closeText:SetPoint("CENTER")
 closeText:SetText("X")
 local closeHL = close:CreateTexture(nil, "HIGHLIGHT")
 closeHL:SetAllPoints()
 closeHL:SetColorTexture(1, 0.3, 0.3, 0.35)
-SecureHandlerSetFrameRef(close, "main", frame)
-close:SetAttribute("_onclick", [[ self:GetFrameRef("main"):Hide() ]])
-close:HookScript("OnClick", function()
+close:SetScript("OnClick", function()
     db.hidden = true
-    SecureRefresh()
-    Print("window closed. Type /pc show (or /pc config) to bring it back.")
+    if InCombatLockdown() then
+        frame:SetAlpha(0)
+        pending = true
+        Print("window hidden; it closes fully when combat ends. /pc show brings it back.")
+    else
+        SecureRefresh()
+        Print("window closed. Type /pc show (or /pc config) to bring it back.")
+    end
 end)
-close:HookScript("OnEnter", function(self)
+close:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
     GameTooltip:AddLine("Close")
     GameTooltip:AddLine("/pc show brings it back.", 0.6, 0.6, 0.6)
     GameTooltip:Show()
 end)
-close:HookScript("OnLeave", function() GameTooltip:Hide() end)
+close:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
 local cog = CreateFrame("Button", nil, header)
 cog:SetSize(14, 14)
@@ -875,6 +1024,9 @@ cog:SetScript("OnLeave", function() GameTooltip:Hide() end)
 -- Slash commands
 ---------------------------------------------------------------------------
 local function Debug()
+    local v1, v2, v3 = VersionInfo()
+    Print(v1 .. " | " .. v2)
+    Print(v3 .. (containerError and (" - " .. containerError) or ""))
     local _, class = UnitClass("player")
     local types = {}
     for t in pairs(canDispel) do types[#types + 1] = t end
@@ -911,6 +1063,7 @@ end
 
 local function SetHidden(hidden)
     db.hidden = hidden
+    if not hidden then frame:SetAlpha(1) end
     SecureRefresh()
     if InCombatLockdown() then
         Print("that will apply when combat ends.")
@@ -948,6 +1101,9 @@ SlashCmdList.PHANTOMCURSE = function(msg)
         ApplySettings()
         if settings then settings.mode.Refresh() end
         Print("display mode: " .. (db.onlyAfflicted and "names only when removable." or "names always shown."))
+    elseif msg == "version" then
+        local v1, v2, v3 = VersionInfo()
+        Print(v1 .. " | " .. v2 .. " | " .. v3)
     elseif msg == "debug" then
         Debug()
     elseif msg == "spells" then
@@ -959,7 +1115,7 @@ SlashCmdList.PHANTOMCURSE = function(msg)
             end
         end
     else
-        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | test | spells | debug")
+        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | test | spells | version | debug")
     end
 end
 
