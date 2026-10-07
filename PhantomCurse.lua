@@ -63,6 +63,7 @@ local CLASS_SPELLS = {
         { 2870,   "Cure Disease",       "Disease" },
     },
     MAGE = {
+        { 412113, "Remove Greater Curse", "Curse", "Magic" },
         { 475,    "Remove Lesser Curse", "Curse" },
         { 0,      "Remove Curse",       "Curse" },
     },
@@ -110,6 +111,7 @@ for k, v in pairs(DEFAULTS) do db[k] = v end
 local buttons, byUnit = {}, {}
 local activeSpells = {}
 local canDispel = {}           -- debuff types your known spells remove
+local spellTypes = {}           -- per click: the debuff types that click's spell removes
 local pending = false          -- secure work postponed until combat ends
 local lastSound = 0
 local curve                    -- debuff type -> colour
@@ -127,6 +129,13 @@ end
 ---------------------------------------------------------------------------
 local function IsKnown(id)
     local ok, known
+    if C_SpellBook and C_SpellBook.IsSpellKnownOrInSpellBook then
+        local banks = Enum and Enum.SpellBookSpellBank
+        for _, bank in ipairs({ banks and banks.Player or 0, banks and banks.Pet or 1 }) do
+            ok, known = pcall(C_SpellBook.IsSpellKnownOrInSpellBook, id, bank, true)
+            if ok and known then return true end
+        end
+    end
     if C_SpellBook and C_SpellBook.IsSpellKnown then
         ok, known = pcall(C_SpellBook.IsSpellKnown, id)
         if ok and known then return true end
@@ -165,6 +174,7 @@ end
 local function FindSpells()
     local found, seen = {}, {}
     wipe(canDispel)
+    wipe(spellTypes)
     local _, class = UnitClass("player")
     for _, entry in ipairs(CLASS_SPELLS[class] or {}) do
         local castName
@@ -174,10 +184,16 @@ local function FindSpells()
             castName = entry[2]
         end
         if castName then
-            for i = 3, #entry do canDispel[entry[i]] = true end
-            if not seen[castName] and #found < #CLICKS then
-                seen[castName] = true
-                found[#found + 1] = castName
+            local idx = seen[castName]
+            if not idx and #found < #CLICKS then
+                idx = #found + 1
+                seen[castName] = idx
+                found[idx] = castName
+                spellTypes[idx] = {}
+            end
+            for i = 3, #entry do
+                canDispel[entry[i]] = true
+                if idx then spellTypes[idx][entry[i]] = true end
             end
         end
     end
@@ -414,8 +430,10 @@ local function UpdateButton(b)
     local detected = testing or (not b.container and aura)
     local layered = false
 
-    if b.auraParts and b.auraParts.name and not InCombatLockdown() then
-        pcall(b.auraParts.name.SetText, b.auraParts.name, text)
+    if b.auraParts and not InCombatLockdown() then
+        for _, fs in pairs(b.auraParts.names) do
+            pcall(fs.SetText, fs, text)
+        end
     end
 
     -- Alert sound: only possible while the addon itself can see the debuff,
@@ -471,23 +489,43 @@ end
 ---------------------------------------------------------------------------
 -- Secure unit buttons
 ---------------------------------------------------------------------------
--- The debuff types the game-drawn highlight should react to.
-local function DispelTypeSet()
+-- The game-drawn highlight has one aura slot per click (left, right, middle,
+-- shift+left) plus a spare. Each slot only accepts the debuff types that
+-- click's spell removes, so the letter on the highlight tells you which click
+-- to use. A type is given to the first click that can remove it. The spare
+-- slot takes whatever is left when "highlight all types" is on or no dispel
+-- spell could be detected.
+local N_SLOTS = 5
+local SLOT_LETTERS = { "L", "R", "M", "S", "" }
+
+local function SlotTypeSets()
+    local sets, keys, covered = {}, {}, {}
+    for i = 1, N_SLOTS - 1 do
+        local set, key = {}, ""
+        for _, dtype in ipairs(TYPE_ORDER) do
+            if spellTypes[i] and spellTypes[i][dtype] and not covered[dtype] then
+                set[dtype] = true
+                covered[dtype] = true
+                key = key .. dtype
+            end
+        end
+        sets[i], keys[i] = set, key
+    end
     local set, key = {}, ""
     for _, dtype in ipairs(TYPE_ORDER) do
-        if Removable(dtype) then
+        if not covered[dtype] and Removable(dtype) then
             set[dtype] = true
             key = key .. dtype
         end
     end
-    return set, key
+    sets[N_SLOTS], keys[N_SLOTS] = set, key
+    return sets, keys
 end
 
 -- Builds the game-drawn highlight for one row: an AuraContainer watching the
--- row's unit, with a single aura slot that only accepts debuffs of the given
--- dispel types. The slot's button fills the row and is shown/hidden by the
+-- row's unit. Each slot's button fills the row and is shown/hidden by the
 -- game, so it works in combat. Everything drawn inside it (fill, outline,
--- name) appears and disappears with it.
+-- name, click letter) appears and disappears with it.
 local function AttachContainer(b)
     local ok, err = pcall(function()
         local c = CreateFrame("AuraContainer", nil, b, "CustomAuraContainerTemplate")
@@ -495,55 +533,63 @@ local function AttachContainer(b)
         c:SetFrameLevel(b:GetFrameLevel() + 3)
         c:SetUnit(b.unit)
 
-        local parts = {}
-        local set, key = DispelTypeSet()
+        local parts = { names = {}, letters = {}, pulses = {} }
+        local sets, keys = SlotTypeSets()
         local styles = Enum and Enum.CustomAuraButtonDispelTypeTextureStyle
         local preserve = styles and styles.PreserveAsset or 3
 
-        c:AddAuraSlot("dispel", "HARMFUL", {
-            candidateFilters = { includeDispelTypes = set },
-            initializeFrame = function(btn)
-                btn:ClearAllPoints()
-                btn:SetAllPoints(c)
-                pcall(btn.EnableMouse, btn, false) -- clicks must reach the row
+        for slot = 1, N_SLOTS do
+            c:AddAuraSlot("dispel" .. slot, "HARMFUL", {
+                candidateFilters = { includeDispelTypes = sets[slot] },
+                initializeFrame = function(btn)
+                    btn:ClearAllPoints()
+                    btn:SetAllPoints(c)
+                    pcall(btn.EnableMouse, btn, false) -- clicks must reach the row
 
-                -- Fill, tinted by the game in the debuff type's colour.
-                local fill = btn:CreateTexture(nil, "BACKGROUND")
-                fill:SetAllPoints()
-                fill:SetTexture("Interface\\Buttons\\WHITE8x8")
-                fill:SetVertexColor(1, 0.1, 0.1)
-                pcall(btn.AddDispelTypeTexture, btn, fill, { style = preserve })
+                    -- Fill, tinted by the game in the debuff type's colour.
+                    local fill = btn:CreateTexture(nil, "BACKGROUND")
+                    fill:SetAllPoints()
+                    fill:SetTexture("Interface\\Buttons\\WHITE8x8")
+                    fill:SetVertexColor(1, 0.1, 0.1)
+                    pcall(btn.AddDispelTypeTexture, btn, fill, { style = preserve })
 
-                for i = 1, 4 do
-                    local e = btn:CreateTexture(nil, "BORDER")
-                    e:SetColorTexture(1, 1, 1, 0.9)
-                    if i == 1 then e:SetPoint("TOPLEFT"); e:SetPoint("TOPRIGHT"); e:SetHeight(1)
-                    elseif i == 2 then e:SetPoint("BOTTOMLEFT"); e:SetPoint("BOTTOMRIGHT"); e:SetHeight(1)
-                    elseif i == 3 then e:SetPoint("TOPLEFT"); e:SetPoint("BOTTOMLEFT"); e:SetWidth(1)
-                    else e:SetPoint("TOPRIGHT"); e:SetPoint("BOTTOMRIGHT"); e:SetWidth(1) end
-                end
+                    for i = 1, 4 do
+                        local e = btn:CreateTexture(nil, "BORDER")
+                        e:SetColorTexture(1, 1, 1, 0.9)
+                        if i == 1 then e:SetPoint("TOPLEFT"); e:SetPoint("TOPRIGHT"); e:SetHeight(1)
+                        elseif i == 2 then e:SetPoint("BOTTOMLEFT"); e:SetPoint("BOTTOMRIGHT"); e:SetHeight(1)
+                        elseif i == 3 then e:SetPoint("TOPLEFT"); e:SetPoint("BOTTOMLEFT"); e:SetWidth(1)
+                        else e:SetPoint("TOPRIGHT"); e:SetPoint("BOTTOMRIGHT"); e:SetWidth(1) end
+                    end
 
-                local fs = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-                fs:SetPoint("LEFT", 4, 0)
-                fs:SetPoint("RIGHT", -4, 0)
-                fs:SetJustifyH("LEFT")
-                fs:SetWordWrap(false)
-                parts.name = fs
+                    local fs = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+                    fs:SetPoint("LEFT", 4, 0)
+                    fs:SetPoint("RIGHT", -14, 0)
+                    fs:SetJustifyH("LEFT")
+                    fs:SetWordWrap(false)
+                    parts.names[slot] = fs
 
-                local ag = fill:CreateAnimationGroup()
-                local fade = ag:CreateAnimation("Alpha")
-                fade:SetFromAlpha(1)
-                fade:SetToAlpha(0.4)
-                fade:SetDuration(0.45)
-                ag:SetLooping("BOUNCE")
-                parts.pulse = ag
-                parts.btn = btn
-            end,
-        })
+                    -- Which click removes it. Each slot's letter has its own
+                    -- spot so two can show at once.
+                    local letter = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+                    letter:SetPoint("RIGHT", -3 - (slot - 1) * 9, 0)
+                    letter:SetTextColor(1, 1, 0.4)
+                    parts.letters[slot] = letter
+
+                    local ag = fill:CreateAnimationGroup()
+                    local fade = ag:CreateAnimation("Alpha")
+                    fade:SetFromAlpha(1)
+                    fade:SetToAlpha(0.4)
+                    fade:SetDuration(0.45)
+                    ag:SetLooping("BOUNCE")
+                    parts.pulses[slot] = { btn = btn, ag = ag }
+                end,
+            })
+        end
 
         b.container = c
         b.auraParts = parts
-        b.filterKey = key
+        b.filterKeys = keys
     end)
     if not ok then
         b.container = nil
@@ -555,23 +601,41 @@ end
 -- Keeps the game-drawn highlight in step with your spells and settings.
 -- Out of combat only: the game locks these frames while aura data is secret.
 local function UpdateContainers()
-    local set, key = DispelTypeSet()
+    local sets, keys = SlotTypeSets()
+    local showLetters = #activeSpells > 1
     for _, b in ipairs(buttons) do
         if b.container then
-            if b.filterKey ~= key then
-                local ok = pcall(b.container.SetAuraSlotCandidateFilters, b.container, "dispel",
-                    { includeDispelTypes = set })
-                if ok then b.filterKey = key end
-            end
             local parts = b.auraParts
-            if parts and parts.btn and parts.pulse and parts.pulseOn ~= db.pulse then
-                pcall(parts.btn.RemoveAuraShownAnimation, parts.btn, parts.pulse)
-                pcall(parts.pulse.Stop, parts.pulse)
-                if db.pulse then
-                    pcall(parts.btn.AddAuraShownAnimation, parts.btn, parts.pulse)
+            for slot = 1, N_SLOTS do
+                if b.filterKeys[slot] ~= keys[slot] then
+                    local ok = pcall(b.container.SetAuraSlotCandidateFilters, b.container,
+                        "dispel" .. slot, { includeDispelTypes = sets[slot] })
+                    if ok then b.filterKeys[slot] = keys[slot] end
                 end
-                parts.pulseOn = db.pulse
+                local letter = parts.letters[slot]
+                if letter then
+                    pcall(letter.SetText, letter, showLetters and SLOT_LETTERS[slot] or "")
+                end
+                local pulse = parts.pulses[slot]
+                if pulse and pulse.on ~= db.pulse then
+                    pcall(pulse.btn.RemoveAuraShownAnimation, pulse.btn, pulse.ag)
+                    pcall(pulse.ag.Stop, pulse.ag)
+                    if db.pulse then
+                        pcall(pulse.btn.AddAuraShownAnimation, pulse.btn, pulse.ag)
+                    end
+                    pulse.on = db.pulse
+                end
             end
+        end
+    end
+end
+
+-- Makes every row re-read its unit's debuffs. Needed when the group changes,
+-- because "raid3" may now be a different person.
+local function RefreshContainers()
+    for _, b in ipairs(buttons) do
+        if b.container then
+            pcall(b.container.UpdateAllAuras, b.container)
         end
     end
 end
@@ -1027,6 +1091,13 @@ local function Debug()
     local v1, v2, v3 = VersionInfo()
     Print(v1 .. " | " .. v2)
     Print(v3 .. (containerError and (" - " .. containerError) or ""))
+    for i, name in ipairs(activeSpells) do
+        local types = {}
+        for _, t in ipairs(TYPE_ORDER) do
+            if spellTypes[i] and spellTypes[i][t] then types[#types + 1] = t end
+        end
+        Print("  " .. CLICKS[i].label .. ": " .. name .. " -> " .. table.concat(types, ", "))
+    end
     local _, class = UnitClass("player")
     local types = {}
     for t in pairs(canDispel) do types[#types + 1] = t end
@@ -1173,6 +1244,7 @@ events:SetScript("OnEvent", function(_, event, arg1)
         UpdateAll()
 
     elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+        RefreshContainers()
         SecureRefresh()
         UpdateAll()
 
