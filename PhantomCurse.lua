@@ -10,12 +10,11 @@
 --  * In combat the client hides all aura data from addon code ("secret
 --    values"), so an addon cannot see who has which debuff. The highlight is
 --    therefore drawn by the game itself: every row holds an AuraContainer
---    with one aura slot that only accepts debuffs of the types your dispel
---    removes. The game shows that slot the moment a matching debuff lands
---    and hides it when it is gone, in or out of combat.
---  * Addon-side detection (reading debuff types directly) still runs out of
---    combat for the alert sound, and as a fallback on clients without
---    AuraContainer.
+--    with aura slots that only accept debuffs of the types your dispels
+--    remove. The game shows a slot the moment a matching debuff lands and
+--    hides it when it is gone, in or out of combat.
+--  * Addon-side detection (reading debuff types directly) still runs for the
+--    alert sound, and as a fallback on clients without AuraContainer.
 
 local ADDON = ...
 
@@ -35,9 +34,10 @@ local TYPE_COLORS = {
 local DEFAULT_COLOR = { 1.00, 0.10, 0.10 }
 
 -- Candidate dispels per class: spell ID, English name, and the debuff types
--- it removes. A spell counts as known if either the ID or the name is found
--- in your spellbook. Whichever ones you know are used, in this order:
--- left click, right click, middle click, shift+left click.
+-- it removes. A spell counts as known if its ID is in your spellbook, or (only
+-- when that ID doesn't exist on this client) if its name is. Whichever ones
+-- you know are used, in this order: left click, right click, middle click,
+-- shift+left click.
 local CLASS_SPELLS = {
     PRIEST = {
         { 527,    "Dispel Magic",       "Magic" },
@@ -82,6 +82,7 @@ local CLASS_SPELLS = {
 }
 
 local TYPE_IDS = { Magic = 1, Curse = 2, Disease = 3, Poison = 4 }
+local TYPE_ORDER = { "Magic", "Curse", "Disease", "Poison" }
 local N_LAYERS = 16
 
 local CLICKS = {
@@ -100,7 +101,7 @@ local DEFAULTS = {
     pulse = true,
     hidden = false,
     allTypes = false,          -- highlight every typed debuff, removable or not
-    onlyAfflicted = false,     -- display mode: names only when removable
+    onlyAfflicted = true,      -- Decursive-style: names only when removable
     scale = 1,
     alpha = 0.85,
 }
@@ -111,8 +112,11 @@ for k, v in pairs(DEFAULTS) do db[k] = v end
 local buttons, byUnit = {}, {}
 local activeSpells = {}
 local canDispel = {}           -- debuff types your known spells remove
-local spellTypes = {}           -- per click: the debuff types that click's spell removes
+local spellTypes = {}          -- per click: the debuff types that click's spell removes
+local playerClass
 local pending = false          -- secure work postponed until combat ends
+local spellsDirty = true       -- spellbook needs rescanning on next secure refresh
+local lastDriver               -- last window visibility driver registered
 local lastSound = 0
 local curve                    -- debuff type -> colour
 local maskCurve                -- same, but invisible for types you can't remove
@@ -154,6 +158,7 @@ local function IsKnown(id)
 end
 
 local function SpellName(id)
+    if id <= 0 then return nil end
     if C_Spell and C_Spell.GetSpellName then
         return C_Spell.GetSpellName(id)
     elseif GetSpellInfo then
@@ -161,26 +166,37 @@ local function SpellName(id)
     end
 end
 
-local function KnownByName(name)
+-- Name lookup is only a fallback for IDs this client doesn't have. Without
+-- that check, two spells sharing a name (Monk "Detox" is two different
+-- spells) would both count as known and add types you can't remove.
+local function KnownByName(name, id)
+    local spellID
     if C_Spell and C_Spell.GetSpellInfo then
         local ok, info = pcall(C_Spell.GetSpellInfo, name)
-        return ok and info ~= nil
+        if not (ok and info) then return false end
+        spellID = info.spellID
     elseif GetSpellInfo then
-        return GetSpellInfo(name) ~= nil
+        local n, _, _, _, _, _, sid = GetSpellInfo(name)
+        if not n then return false end
+        spellID = sid
+    else
+        return false
     end
-    return false
+    if id > 0 and spellID and spellID ~= id and SpellName(id) then
+        return false
+    end
+    return true
 end
 
 local function FindSpells()
     local found, seen = {}, {}
     wipe(canDispel)
     wipe(spellTypes)
-    local _, class = UnitClass("player")
-    for _, entry in ipairs(CLASS_SPELLS[class] or {}) do
+    for _, entry in ipairs(CLASS_SPELLS[playerClass] or {}) do
         local castName
         if entry[1] > 0 and IsKnown(entry[1]) then
             castName = SpellName(entry[1]) or entry[2]
-        elseif KnownByName(entry[2]) then
+        elseif KnownByName(entry[2], entry[1]) then
             castName = entry[2]
         end
         if castName then
@@ -261,14 +277,14 @@ header:SetScript("OnLeave", function() GameTooltip:Hide() end)
 ---------------------------------------------------------------------------
 -- Debuff detection
 ---------------------------------------------------------------------------
--- Is this debuff type one to highlight? If no dispel spell could be detected
--- the addon can't know what you remove, so it falls back to all four types.
+-- Is this debuff type one to highlight? Classes with no dispel at all get
+-- nothing. If a dispel class's spells couldn't be detected, it falls back to
+-- all four types rather than silently showing nothing.
 local function Removable(dtype)
     if not TYPE_IDS[dtype] then return false end
-    return db.allTypes or next(canDispel) == nil or canDispel[dtype] or false
+    if db.allTypes or canDispel[dtype] then return true end
+    return next(canDispel) == nil and CLASS_SPELLS[playerClass] ~= nil
 end
-
-local TYPE_ORDER = { "Magic", "Curse", "Disease", "Poison" }
 
 -- mask = true makes every type you cannot remove fully transparent, so a
 -- texture coloured through the curve only shows for removable debuffs. This
@@ -363,9 +379,9 @@ local function HideLayers(b)
     end
 end
 
--- One texture per debuff, coloured through the mask curve: removable types
--- show in their colour, everything else is transparent. Nothing is read here,
--- so it keeps working when aura details are secret.
+-- Fallback highlight (no AuraContainer): one texture per debuff, coloured
+-- through the mask curve: removable types show in their colour, everything
+-- else is transparent. Nothing is read here, so it works with secret values.
 local function UpdateLayers(b, unit, text)
     if not (maskCurve and C_UnitAuras.GetAuraDispelTypeColor) then
         HideLayers(b)
@@ -414,6 +430,10 @@ local function ClearHighlight(b)
 end
 
 local function UpdateButton(b)
+    -- Rows the game has hidden (party rows in a raid, empty raid slots, or
+    -- the whole window) are skipped; OnShow refreshes them when they return.
+    if not b:IsVisible() then return end
+
     local unit = b.unit
     if not UnitExists(unit) then
         ClearHighlight(b)
@@ -421,6 +441,7 @@ local function UpdateButton(b)
     end
 
     local text = GetUnitName(unit, false) or unit
+    b.displayName = text
     b.name:SetText(text)
 
     local aura = FindDispellable(unit)
@@ -430,14 +451,15 @@ local function UpdateButton(b)
     local detected = testing or (not b.container and aura)
     local layered = false
 
-    if b.auraParts and not InCombatLockdown() then
+    -- Names inside the game-drawn highlight. Only rewritten when they change,
+    -- and only out of combat (the game locks those frames in combat).
+    if b.auraParts and b.slotText ~= text and not InCombatLockdown() then
         for _, fs in pairs(b.auraParts.names) do
             pcall(fs.SetText, fs, text)
         end
+        b.slotText = text
     end
 
-    -- Alert sound: only possible while the addon itself can see the debuff,
-    -- which the game does not allow in combat.
     if aura then
         if not b.afflicted then
             b.afflicted = true
@@ -487,6 +509,60 @@ local function UpdateAll()
 end
 
 ---------------------------------------------------------------------------
+-- Batched aura updates
+---------------------------------------------------------------------------
+-- UNIT_AURA can fire dozens of times per second in a raid, often several
+-- times for the same unit in one frame. Units are collected and processed
+-- once on the next frame, so each row is updated at most once per frame.
+local dirty = {}
+local flushAll = false
+local stamp = 0
+
+local function Touch(b)
+    if b.stamp ~= stamp then
+        b.stamp = stamp
+        UpdateButton(b)
+    end
+end
+
+local flusher = CreateFrame("Frame")
+flusher:Hide()
+flusher:SetScript("OnUpdate", function(self)
+    self:Hide()
+    stamp = stamp + 1
+    if flushAll then
+        flushAll = false
+        wipe(dirty)
+        UpdateAll()
+        return
+    end
+    for unit in pairs(dirty) do
+        local b = byUnit[unit]
+        if b:IsVisible() then
+            Touch(b)
+        else
+            -- e.g. "player" or "party2" while in a raid: their rows are hidden,
+            -- so find the raid row showing the same person.
+            for _, rb in ipairs(buttons) do
+                if rb:IsVisible() and UnitIsUnit(rb.unit, unit) then Touch(rb) end
+            end
+        end
+    end
+    wipe(dirty)
+end)
+
+local function MarkDirty(unit)
+    if not byUnit[unit] then return end -- target, nameplates, etc.
+    dirty[unit] = true
+    flusher:Show()
+end
+
+local function MarkAllDirty()
+    flushAll = true
+    flusher:Show()
+end
+
+---------------------------------------------------------------------------
 -- Secure unit buttons
 ---------------------------------------------------------------------------
 -- The game-drawn highlight has one aura slot per click (left, right, middle,
@@ -497,6 +573,10 @@ end
 -- spell could be detected.
 local N_SLOTS = 5
 local SLOT_LETTERS = { "L", "R", "M", "S", "" }
+
+local function LetterFor(slot)
+    return #activeSpells > 1 and SLOT_LETTERS[slot] or ""
+end
 
 local function SlotTypeSets()
     local sets, keys, covered = {}, {}, {}
@@ -526,6 +606,10 @@ end
 -- row's unit. Each slot's button fills the row and is shown/hidden by the
 -- game, so it works in combat. Everything drawn inside it (fill, outline,
 -- name, click letter) appears and disappears with it.
+--
+-- initializeFrame may run lazily, the first time a debuff actually lands,
+-- which can be mid-combat. So it fills in the name, letter and pulse itself
+-- from what is already known, instead of waiting for an out-of-combat update.
 local function AttachContainer(b)
     local ok, err = pcall(function()
         local c = CreateFrame("AuraContainer", nil, b, "CustomAuraContainerTemplate")
@@ -567,6 +651,7 @@ local function AttachContainer(b)
                     fs:SetPoint("RIGHT", -14, 0)
                     fs:SetJustifyH("LEFT")
                     fs:SetWordWrap(false)
+                    fs:SetText(b.displayName or GetUnitName(b.unit, false) or "")
                     parts.names[slot] = fs
 
                     -- Which click removes it. Each slot's letter has its own
@@ -574,6 +659,7 @@ local function AttachContainer(b)
                     local letter = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
                     letter:SetPoint("RIGHT", -3 - (slot - 1) * 9, 0)
                     letter:SetTextColor(1, 1, 0.4)
+                    letter:SetText(LetterFor(slot))
                     parts.letters[slot] = letter
 
                     local ag = fill:CreateAnimationGroup()
@@ -582,7 +668,10 @@ local function AttachContainer(b)
                     fade:SetToAlpha(0.4)
                     fade:SetDuration(0.45)
                     ag:SetLooping("BOUNCE")
-                    parts.pulses[slot] = { btn = btn, ag = ag }
+                    if db.pulse then
+                        pcall(btn.AddAuraShownAnimation, btn, ag)
+                    end
+                    parts.pulses[slot] = { btn = btn, ag = ag, on = db.pulse }
                 end,
             })
         end
@@ -602,7 +691,6 @@ end
 -- Out of combat only: the game locks these frames while aura data is secret.
 local function UpdateContainers()
     local sets, keys = SlotTypeSets()
-    local showLetters = #activeSpells > 1
     for _, b in ipairs(buttons) do
         if b.container then
             local parts = b.auraParts
@@ -614,7 +702,7 @@ local function UpdateContainers()
                 end
                 local letter = parts.letters[slot]
                 if letter then
-                    pcall(letter.SetText, letter, showLetters and SLOT_LETTERS[slot] or "")
+                    pcall(letter.SetText, letter, LetterFor(slot))
                 end
                 local pulse = parts.pulses[slot]
                 if pulse and pulse.on ~= db.pulse then
@@ -797,18 +885,24 @@ local function ApplyVisibility()
             driver = "[" .. table.concat(conds, ",") .. "] show; hide"
         end
     end
-    frame:SetAlpha(1)
-    RegisterStateDriver(frame, "visibility", driver)
+    if driver ~= lastDriver then
+        lastDriver = driver
+        RegisterStateDriver(frame, "visibility", driver)
+    end
 end
 
--- Everything that touches secure frames. Postponed while in combat.
+-- Everything that touches secure frames. Postponed while in combat. The
+-- spellbook is only rescanned when something actually changed it.
 local function SecureRefresh()
     if InCombatLockdown() then
         pending = true
         return
     end
     pending = false
-    ApplySpells()
+    if spellsDirty then
+        spellsDirty = false
+        ApplySpells()
+    end
     UpdateContainers()
     ResizeWindow()
     frame:SetScale(db.scale or 1)
@@ -823,8 +917,8 @@ local function ApplySettings()
     frame:SetBackdropColor(0.05, 0.03, 0.08, compact and 0 or (db.alpha or 0.85))
     frame:SetBackdropBorderColor(0.45, 0.30, 0.75, compact and 0 or 1)
     header.bg:SetShown(compact and true or false)
-    UpdateAll()
     SecureRefresh()
+    MarkAllDirty()
 end
 
 local function ResetPosition()
@@ -840,15 +934,16 @@ end
 local function TestHighlight()
     local b = byUnit[IsInRaid() and "raid1" or "player"]
     if not b then return end
+    if not frame:IsShown() then
+        Print("the window is hidden right now, so the test highlight can't be seen.")
+        return
+    end
     b.testUntil = GetTime() + 5
     if db.sound then
         PlaySound(SOUNDKIT and SOUNDKIT.RAID_WARNING or 8959, "Master")
     end
     UpdateButton(b)
-    C_Timer.After(5.1, UpdateAll)
-    if not frame:IsShown() then
-        Print("the window is hidden right now, so the test highlight can't be seen.")
-    end
+    C_Timer.After(5.1, MarkAllDirty)
 end
 
 ---------------------------------------------------------------------------
@@ -1009,7 +1104,7 @@ local function BuildSettings()
     note:SetPoint("BOTTOMLEFT", 12, 8)
     note:SetPoint("BOTTOMRIGHT", -12, 8)
     note:SetJustifyH("LEFT")
-    note:SetText("Show/hide and scale changes made in combat apply when combat ends.")
+    note:SetText("Show and scale changes made in combat apply when combat ends.")
 
     f:SetScript("OnShow", function()
         f.mode.Refresh()
@@ -1037,28 +1132,25 @@ end
 ---------------------------------------------------------------------------
 -- Title bar buttons: settings cog and close
 ---------------------------------------------------------------------------
--- The game does not let addons hide a window holding cast buttons during
--- combat, so a close in combat makes it invisible and finishes afterwards.
-local close = CreateFrame("Button", nil, header)
+-- The close button hides the window through a secure snippet, which the game
+-- allows even in combat. (Making it see-through instead would leave invisible
+-- cast buttons on screen that still catch clicks.)
+local close = CreateFrame("Button", nil, header, "SecureHandlerClickTemplate")
 close:SetSize(14, 14)
 close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -2, -1)
 close:SetFrameLevel(header:GetFrameLevel() + 2)
+close:SetFrameRef("window", frame)
+close:SetAttribute("_onclick", [[ self:GetFrameRef("window"):Hide() ]])
 local closeText = close:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 closeText:SetPoint("CENTER")
 closeText:SetText("X")
 local closeHL = close:CreateTexture(nil, "HIGHLIGHT")
 closeHL:SetAllPoints()
 closeHL:SetColorTexture(1, 0.3, 0.3, 0.35)
-close:SetScript("OnClick", function()
+close:HookScript("OnClick", function()
     db.hidden = true
-    if InCombatLockdown() then
-        frame:SetAlpha(0)
-        pending = true
-        Print("window hidden; it closes fully when combat ends. /pc show brings it back.")
-    else
-        SecureRefresh()
-        Print("window closed. Type /pc show (or /pc config) to bring it back.")
-    end
+    SecureRefresh() -- postponed automatically if in combat
+    Print("window closed. Type /pc show (or /pc config) to bring it back.")
 end)
 close:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
@@ -1098,10 +1190,9 @@ local function Debug()
         end
         Print("  " .. CLICKS[i].label .. ": " .. name .. " -> " .. table.concat(types, ", "))
     end
-    local _, class = UnitClass("player")
     local types = {}
     for t in pairs(canDispel) do types[#types + 1] = t end
-    Print("class " .. tostring(class)
+    Print("class " .. tostring(playerClass)
         .. " | spells: " .. (#activeSpells > 0 and table.concat(activeSpells, ", ") or "NONE FOUND")
         .. " | removes: " .. (#types > 0 and table.concat(types, ", ") or "nothing"))
     Print("game filter " .. (filterOK and "ok" or "rejected")
@@ -1113,7 +1204,7 @@ local function Debug()
         if Removable(t) then shown[#shown + 1] = t end
     end
     local ids, how = HarmfulIDs("player")
-    Print("highlighting types: " .. table.concat(shown, ", ")
+    Print("highlighting types: " .. (#shown > 0 and table.concat(shown, ", ") or "none")
         .. " | debuffs the addon can see on you: " .. #ids .. " (" .. how .. ")")
     local okF, hit = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
     Print("game says you have something you can remove: " .. ((okF and hit) and "yes" or "no"))
@@ -1134,7 +1225,6 @@ end
 
 local function SetHidden(hidden)
     db.hidden = hidden
-    if not hidden then frame:SetAlpha(1) end
     SecureRefresh()
     if InCombatLockdown() then
         Print("that will apply when combat ends.")
@@ -1203,7 +1293,10 @@ events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 
 events:SetScript("OnEvent", function(_, event, arg1)
-    if event == "ADDON_LOADED" then
+    if event == "UNIT_AURA" then
+        MarkDirty(arg1)
+
+    elseif event == "ADDON_LOADED" then
         if arg1 ~= ADDON then return end
         PhantomCurseDB = PhantomCurseDB or {}
         for k, v in pairs(DEFAULTS) do
@@ -1216,14 +1309,18 @@ events:SetScript("OnEvent", function(_, event, arg1)
         end
 
     elseif event == "PLAYER_LOGIN" then
+        local _, class = UnitClass("player")
+        playerClass = class
         -- Skip the client-side filter if this client rejects it.
         filterOK = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
+        spellsDirty = true
         CreateButtons()
         ApplySettings()
 
-        -- Safety net in case an aura change arrives without an event.
+        -- Safety net in case an aura change arrives without an event. Only
+        -- visible rows are touched.
         C_Timer.NewTicker(0.5, function()
-            if frame:IsShown() then UpdateAll() end
+            if frame:IsVisible() then MarkAllDirty() end
         end)
 
         SafeRegister("UNIT_AURA")
@@ -1235,20 +1332,24 @@ events:SetScript("OnEvent", function(_, event, arg1)
         SafeRegister("PLAYER_SPECIALIZATION_CHANGED")
         SafeRegister("UNIT_PET")
 
-    elseif event == "UNIT_AURA" then
-        local b = byUnit[arg1]
-        if b then UpdateButton(b) end
-
     elseif event == "PLAYER_REGEN_ENABLED" then
         if pending then SecureRefresh() end
-        UpdateAll()
+        MarkAllDirty()
 
     elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+        if event == "PLAYER_ENTERING_WORLD" then spellsDirty = true end
         RefreshContainers()
         SecureRefresh()
-        UpdateAll()
+        MarkAllDirty()
 
-    else -- spell / talent / pet changes
+    elseif event == "UNIT_PET" then
+        -- Fires for every raid member's pet; only yours can change your spells.
+        if arg1 ~= "player" then return end
+        spellsDirty = true
+        SecureRefresh()
+
+    else -- spell / talent changes
+        spellsDirty = true
         SecureRefresh()
     end
 end)
