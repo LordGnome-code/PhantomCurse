@@ -429,6 +429,68 @@ local function ClearHighlight(b)
     HideLayers(b)
 end
 
+---------------------------------------------------------------------------
+-- Alert sound and click-through
+---------------------------------------------------------------------------
+local function PlayAlert()
+    if not db.sound then return end
+    local now = GetTime()
+    if now - lastSound < 2 then return end
+    lastSound = now
+    PlaySound(SOUNDKIT and SOUNDKIT.RAID_WARNING or 8959, "Master")
+end
+
+-- Is a name actually lit up on this row right now? With the game-drawn
+-- highlight that means one of its aura slots is showing, which is exactly
+-- what you see, so the sound and the clickable area can never disagree with
+-- the window.
+local function RowLit(b)
+    if b.testUntil and GetTime() < b.testUntil then return true end
+    if b.container then
+        for _, btn in pairs(b.auraParts.btns) do
+            local ok, shown = pcall(btn.IsShown, btn)
+            if ok and shown then return true end
+        end
+        return false
+    end
+    return b.afflicted and true or false
+end
+
+-- Rows never react to hovering (no highlight box, no mouseover capture).
+-- Clicks are switched off for blank rows, but only out of combat: the game
+-- doesn't allow it in combat, so every row is made clickable again the moment
+-- combat starts, letting names that light up in combat be clicked.
+local function SetRowClickable(b, on)
+    if b.clickable == on or InCombatLockdown() then return end
+    if not pcall(b.SetMouseClickEnabled, b, on) then
+        pcall(b.EnableMouse, b, on)
+    end
+    pcall(b.SetMouseMotionEnabled, b, false)
+    b.clickable = on
+end
+
+local function UpdateClickable(b)
+    if InCombatLockdown() then return end
+    local blank = b:IsVisible() and db.onlyAfflicted and not RowLit(b)
+    SetRowClickable(b, not blank)
+end
+
+-- Called when one of the game's aura slots on a row appears or disappears.
+-- OnShow also fires when the window or row reappears, so the sound only plays
+-- when the slot itself has just turned on and the row wasn't already lit.
+local function SlotChanged(b, btn)
+    local ok, own = pcall(btn.IsShown, btn)
+    own = ok and own or false
+    local fresh = own and not btn.pcWasShown
+    btn.pcWasShown = own
+    local wasLit = b.lit
+    b.lit = RowLit(b)
+    if fresh and not wasLit and btn:IsVisible() then
+        PlayAlert()
+    end
+    UpdateClickable(b)
+end
+
 local function UpdateButton(b)
     -- Rows the game has hidden (party rows in a raid, empty raid slots, or
     -- the whole window) are skipped; OnShow refreshes them when they return.
@@ -444,7 +506,8 @@ local function UpdateButton(b)
     b.displayName = text
     b.name:SetText(text)
 
-    local aura = FindDispellable(unit)
+    -- Rows with the game-drawn highlight don't need the addon's own scan.
+    local aura = not b.container and FindDispellable(unit)
     local testing = b.testUntil and GetTime() < b.testUntil
     -- When the game draws the highlight, the addon only draws its own for
     -- the "Test highlight" button.
@@ -460,16 +523,10 @@ local function UpdateButton(b)
         b.slotText = text
     end
 
-    if aura then
-        if not b.afflicted then
-            b.afflicted = true
-            if db.sound and GetTime() - lastSound > 2 then
-                lastSound = GetTime()
-                PlaySound(SOUNDKIT and SOUNDKIT.RAID_WARNING or 8959, "Master")
-            end
-        end
-    else
-        b.afflicted = false
+    -- Fallback rows only; game-drawn rows play the sound from SlotChanged.
+    if not b.container then
+        if aura and not b.afflicted then PlayAlert() end
+        b.afflicted = aura and true or false
     end
 
     if detected then
@@ -502,6 +559,8 @@ local function UpdateButton(b)
     else
         b.pulse:Stop()
     end
+
+    UpdateClickable(b)
 end
 
 local function UpdateAll()
@@ -617,7 +676,7 @@ local function AttachContainer(b)
         c:SetFrameLevel(b:GetFrameLevel() + 3)
         c:SetUnit(b.unit)
 
-        local parts = { names = {}, letters = {}, pulses = {} }
+        local parts = { names = {}, letters = {}, pulses = {}, btns = {} }
         local sets, keys = SlotTypeSets()
         local styles = Enum and Enum.CustomAuraButtonDispelTypeTextureStyle
         local preserve = styles and styles.PreserveAsset or 3
@@ -672,6 +731,13 @@ local function AttachContainer(b)
                         pcall(btn.AddAuraShownAnimation, btn, ag)
                     end
                     parts.pulses[slot] = { btn = btn, ag = ag, on = db.pulse }
+
+                    -- Sound and clickability follow this slot appearing.
+                    parts.btns[slot] = btn
+                    btn.pcWasShown = false
+                    btn:HookScript("OnShow", function(self) SlotChanged(b, self) end)
+                    btn:HookScript("OnHide", function(self) SlotChanged(b, self) end)
+                    if btn:IsVisible() then SlotChanged(b, btn) end
                 end,
             })
         end
@@ -799,9 +865,8 @@ local function CreateUnitButton(unit, visibility)
     b.edges[3]:SetPoint("TOPLEFT");    b.edges[3]:SetPoint("BOTTOMLEFT");  b.edges[3]:SetWidth(1)
     b.edges[4]:SetPoint("TOPRIGHT");   b.edges[4]:SetPoint("BOTTOMRIGHT"); b.edges[4]:SetWidth(1)
 
-    local hl = b:CreateTexture(nil, "HIGHLIGHT")
-    hl:SetAllPoints()
-    hl:SetColorTexture(1, 1, 1, 0.15)
+    -- No hover highlight, and no mouseover at all: blank rows stay invisible.
+    pcall(b.SetMouseMotionEnabled, b, false)
 
     local name = top:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     name:SetPoint("LEFT", 4, 0)
@@ -813,6 +878,7 @@ local function CreateUnitButton(unit, visibility)
     if useContainers then AttachContainer(b) end
 
     b:SetScript("OnShow", UpdateButton)
+    b:HookScript("OnHide", UpdateClickable)
     RegisterStateDriver(b, "visibility", visibility)
 
     buttons[#buttons + 1] = b
@@ -1327,10 +1393,16 @@ events:SetScript("OnEvent", function(_, event, arg1)
         SafeRegister("GROUP_ROSTER_UPDATE")
         SafeRegister("PLAYER_ENTERING_WORLD")
         SafeRegister("PLAYER_REGEN_ENABLED")
+        SafeRegister("PLAYER_REGEN_DISABLED")
         SafeRegister("SPELLS_CHANGED")
         SafeRegister("PLAYER_TALENT_UPDATE")
         SafeRegister("PLAYER_SPECIALIZATION_CHANGED")
         SafeRegister("UNIT_PET")
+
+    elseif event == "PLAYER_REGEN_DISABLED" then
+        -- Last moment before the combat lock: make every row clickable so a
+        -- name that lights up mid-fight can be clicked.
+        for _, b in ipairs(buttons) do SetRowClickable(b, true) end
 
     elseif event == "PLAYER_REGEN_ENABLED" then
         if pending then SecureRefresh() end
