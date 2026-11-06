@@ -1,10 +1,12 @@
 -- PhantomCurse: click-to-cleanse window for WoW: Forever (12.x UI engine).
 --
 -- How it works on this client:
---  * Each group member gets a secure button whose clicks cast your dispel on
---    that unit. Secure buttons cannot be created, moved, shown or re-bound in
---    combat, so every possible slot is built up front and the game itself
---    shows/hides them through visibility state drivers.
+--  * Each group member gets a plain display row. Secure (click-to-cast)
+--    buttons cannot be moved, shown or hidden in combat, so the rows are NOT
+--    secure: that lets the names stack from the top in the order people got
+--    a removable debuff, in combat too. Clicks go to one secure click area
+--    behind the rows that casts on the "mouseover" unit; hovering a lit name
+--    makes that person the mouseover (through the unit tooltip).
 --  * The window's own visibility (closed, hide out of combat, hide when solo)
 --    is also a state driver, so it can appear the instant combat starts.
 --  * In combat the client hides all aura data from addon code ("secret
@@ -437,7 +439,7 @@ local function ClearHighlight(b)
 end
 
 ---------------------------------------------------------------------------
--- Alert sound and click-through
+-- Alert sound, lit order and hovering
 ---------------------------------------------------------------------------
 local function PlayAlert()
     if not db.sound then return end
@@ -464,28 +466,41 @@ local function RowLit(b)
     return b.afflicted and true or false
 end
 
--- Rows never react to hovering (no highlight box, no mouseover capture).
--- Clicks are switched off for blank rows, but only out of combat: the game
--- doesn't allow it in combat, so every row is made clickable again the moment
--- combat starts, letting names that light up in combat be clicked.
-local function SetRowClickable(b, on)
-    if b.clickable == on or InCombatLockdown() then return end
-    if not pcall(b.SetMouseClickEnabled, b, on) then
-        pcall(b.EnableMouse, b, on)
+-- Rows lit right now, in the order they lit up. The first one sits in the
+-- top row under the title bar, each later one in the next row down.
+local litOrder = {}
+
+local function SetLit(b, lit)
+    lit = lit and true or false
+    if b.lit == lit then return end
+    b.lit = lit
+    for i = #litOrder, 1, -1 do
+        if litOrder[i] == b then table.remove(litOrder, i) end
     end
-    pcall(b.SetMouseMotionEnabled, b, false)
-    b.clickable = on
-    MarkLayout() -- a row lit up or went blank: restack the names
+    if lit then litOrder[#litOrder + 1] = b end
+    MarkLayout()
 end
 
--- Out of combat a row only takes clicks while a name is actually lit on it.
--- Hidden rows and rows with nobody in them are switched off too, so they
--- don't come back clickable before UpdateButton has looked at them.
-local function UpdateClickable(b)
-    if InCombatLockdown() then return end
-    local on = not db.onlyAfflicted
-        or (b:IsVisible() and UnitExists(b.unit) and RowLit(b))
-    SetRowClickable(b, on and true or false)
+-- Hovering a lit name makes that person the game's "mouseover" unit (the
+-- unit tooltip does that), and the click area behind the list casts on the
+-- mouseover unit. Moving off the name clears it again.
+local function HoverEnter(unit, owner)
+    if not UnitExists(unit) then return end
+    GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
+    GameTooltip:SetUnit(unit)
+    GameTooltip:Show()
+end
+local function HoverLeave()
+    GameTooltip:Hide()
+end
+
+-- Sets whether a display frame takes clicks and/or hover. Display frames
+-- never take clicks (those go to the click area underneath).
+local function SetMouse(f, click, motion)
+    if not pcall(f.SetMouseClickEnabled, f, click) then
+        pcall(f.EnableMouse, f, click or motion)
+    end
+    pcall(f.SetMouseMotionEnabled, f, motion)
 end
 
 -- Called when one of the game's aura slots on a row appears or disappears.
@@ -497,11 +512,10 @@ local function SlotChanged(b, btn)
     local fresh = own and not btn.pcWasShown
     btn.pcWasShown = own
     local wasLit = b.lit
-    b.lit = RowLit(b)
+    SetLit(b, RowLit(b))
     if fresh and not wasLit and btn:IsVisible() then
         PlayAlert()
     end
-    UpdateClickable(b)
 end
 
 local function UpdateButton(b)
@@ -512,7 +526,7 @@ local function UpdateButton(b)
     local unit = b.unit
     if not UnitExists(unit) then
         ClearHighlight(b)
-        UpdateClickable(b)
+        SetLit(b, false)
         return
     end
 
@@ -574,7 +588,13 @@ local function UpdateButton(b)
         b.pulse:Stop()
     end
 
-    UpdateClickable(b)
+    -- The row itself only reacts to hovering when its name is drawn by the
+    -- addon (names-always-shown mode, the test highlight, or the fallback
+    -- highlight). Game-drawn names handle hovering on their own slot frames,
+    -- which only exist while the debuff does.
+    SetMouse(b, false, (showRow or layered) and true or false)
+
+    SetLit(b, RowLit(b))
 end
 
 local function UpdateAll()
@@ -622,7 +642,7 @@ flusher:SetScript("OnUpdate", function(self)
         end
         wipe(dirty)
     end
-    if layoutDirty and not InCombatLockdown() and Relayout then Relayout() end
+    if layoutDirty and Relayout then Relayout() end
 end)
 
 local function MarkDirty(unit)
@@ -684,22 +704,23 @@ end
 -- initializeFrame may run lazily, the first time a debuff actually lands,
 -- which can be mid-combat. So it fills in the name, letter and pulse itself
 -- from what is already known, instead of waiting for an out-of-combat update.
--- The game's aura frames sit on top of the row. Aura buttons normally take
--- the mouse (for tooltips), and the game can switch that back on whenever a
--- debuff appears. If they did, they would swallow the click meant for the
--- secure row underneath, so a lit name couldn't be clicked. Force them
--- click-through, and keep forcing it if anything turns the mouse back on.
-local function MakeClickThrough(f)
+-- The game's aura frames sit on top of the click area. They must never take
+-- clicks (the click has to fall through to the click area underneath), and
+-- the slot frames must take hovering (that is what picks who gets cast on).
+-- The game can change a frame's mouse settings when a debuff appears, so the
+-- wanted settings are re-applied whenever anything changes them.
+local function ForceMouse(f, click, motion)
     if f.pcForcing then return end
+    f.pcWant = { click, motion }
     f.pcForcing = true
-    pcall(f.SetMouseClickEnabled, f, false)
-    pcall(f.SetMouseMotionEnabled, f, false)
-    pcall(f.EnableMouse, f, false)
+    SetMouse(f, click, motion)
     f.pcForcing = false
     if not f.pcHooked then
         f.pcHooked = true
-        local function reForce(self, on)
-            if on and not self.pcForcing then MakeClickThrough(self) end
+        local function reForce(self)
+            if not self.pcForcing and self.pcWant then
+                ForceMouse(self, self.pcWant[1], self.pcWant[2])
+            end
         end
         for _, m in ipairs({ "EnableMouse", "SetMouseClickEnabled", "SetMouseMotionEnabled" }) do
             if f[m] then pcall(hooksecurefunc, f, m, reForce) end
@@ -713,7 +734,7 @@ local function AttachContainer(b)
         c:SetAllPoints(b)
         c:SetFrameLevel(b:GetFrameLevel() + 3)
         c:SetUnit(b.unit)
-        MakeClickThrough(c)
+        ForceMouse(c, false, false)
 
         local parts = { names = {}, letters = {}, pulses = {}, btns = {} }
         local sets, keys = SlotTypeSets()
@@ -726,7 +747,10 @@ local function AttachContainer(b)
                 initializeFrame = function(btn)
                     btn:ClearAllPoints()
                     btn:SetAllPoints(c)
-                    MakeClickThrough(btn) -- clicks must reach the row
+                    -- Hover picks the person; clicks fall through to the click area.
+                    ForceMouse(btn, false, true)
+                    pcall(btn.SetScript, btn, "OnEnter", function(self) HoverEnter(b.unit, self) end)
+                    pcall(btn.SetScript, btn, "OnLeave", HoverLeave)
 
                     -- Fill, tinted by the game in the debuff type's colour.
                     local fill = btn:CreateTexture(nil, "BACKGROUND")
@@ -775,10 +799,15 @@ local function AttachContainer(b)
                     parts.btns[slot] = btn
                     btn.pcWasShown = false
                     btn:HookScript("OnShow", function(self)
-                        MakeClickThrough(self)
+                        ForceMouse(self, false, true)
                         SlotChanged(b, self)
                     end)
-                    btn:HookScript("OnHide", function(self) SlotChanged(b, self) end)
+                    btn:HookScript("OnHide", function(self)
+                        -- The name vanished under the mouse: drop the mouseover
+                        -- so a click on the empty spot can't cast on them.
+                        if GameTooltip:IsOwned(self) then HoverLeave() end
+                        SlotChanged(b, self)
+                    end)
                     if btn:IsVisible() then SlotChanged(b, btn) end
                 end,
             })
@@ -836,12 +865,16 @@ local function RefreshContainers()
     end
 end
 
-local function CreateUnitButton(unit, visibility)
-    local b = CreateFrame("Button", "PhantomCurseButton_" .. unit, frame, "SecureActionButtonTemplate")
+-- Each person gets a plain display row (not a secure button), so the addon
+-- can move and hide rows freely, even in combat. Clicks are handled by one
+-- secure click area behind all the rows; see CreateButtons.
+local function CreateUnitButton(unit, isRaid)
+    local b = CreateFrame("Frame", "PhantomCurseRow_" .. unit, frame)
     b:SetSize(BTN_W, BTN_H)
-    b:RegisterForClicks("AnyUp", "AnyDown")
-    b:SetAttribute("unit", unit)
+    b:SetFrameLevel(frame:GetFrameLevel() + 5) -- above the click area
     b.unit = unit
+    b.isRaid = isRaid
+    b:Hide()
 
     local bg = b:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints()
@@ -907,8 +940,11 @@ local function CreateUnitButton(unit, visibility)
     b.edges[3]:SetPoint("TOPLEFT");    b.edges[3]:SetPoint("BOTTOMLEFT");  b.edges[3]:SetWidth(1)
     b.edges[4]:SetPoint("TOPRIGHT");   b.edges[4]:SetPoint("BOTTOMRIGHT"); b.edges[4]:SetWidth(1)
 
-    -- No hover highlight, and no mouseover at all: blank rows stay invisible.
-    pcall(b.SetMouseMotionEnabled, b, false)
+    -- Rows never take clicks. They only take hovering while their name is
+    -- drawn (UpdateButton decides), so blank rows can't be picked.
+    SetMouse(b, false, false)
+    b:SetScript("OnEnter", function(self) HoverEnter(self.unit, self) end)
+    b:SetScript("OnLeave", HoverLeave)
 
     local name = top:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     name:SetPoint("LEFT", 4, 0)
@@ -920,8 +956,10 @@ local function CreateUnitButton(unit, visibility)
     if useContainers then AttachContainer(b) end
 
     b:SetScript("OnShow", UpdateButton)
-    b:HookScript("OnHide", UpdateClickable)
-    RegisterStateDriver(b, "visibility", visibility)
+    b:SetScript("OnHide", function(self)
+        if GameTooltip:IsOwned(self) then HoverLeave() end
+        SetLit(self, false)
+    end)
 
     buttons[#buttons + 1] = b
     byUnit[unit] = b
@@ -935,69 +973,91 @@ local function Place(b, col, row)
         -(HEADER_H + PAD + row * (BTN_H + PAD)))
 end
 
-local function CreateButtons()
-    -- Solo / party: you plus party1-4 in one column.
-    Place(CreateUnitButton("player", "[group:raid] hide; show"), 0, 0)
-    for i = 1, 4 do
-        local unit = "party" .. i
-        Place(CreateUnitButton(unit, "[group:raid] hide; [@" .. unit .. ",exists] show; hide"), 0, i)
-    end
-    -- Raid: columns of ten.
-    for i = 1, 40 do
-        local unit = "raid" .. i
-        local b = CreateUnitButton(unit, "[@" .. unit .. ",exists] show; hide")
-        Place(b, math.floor((i - 1) / RAID_ROWS), (i - 1) % RAID_ROWS)
-    end
-end
-
--- Stacks lit names from the top, straight under the title bar, each new one
--- below the last. Every row keeps a slot of its own (lit first, then the
--- rest in group order) so nothing can ever overlap.
+-- The click area: one secure button covering the list, behind the rows. It
+-- casts on the "mouseover" unit, which is whoever's lit name the mouse is on
+-- (see HoverEnter). Over an empty spot there is no mouseover, and the macro's
+-- [@mouseover,help,nodead] check means nothing is cast.
 --
--- Secure rows can only be moved out of combat. In combat the game hides who
--- has which debuff and locks the rows in place, so a name that lights up
--- mid-fight shows in the slot it already had; the list restacks as soon as
--- combat ends.
-local function Ordered(first, last)
-    local lit, rest, gone = {}, {}, {}
-    for i = first, last do
-        local b = buttons[i]
-        if not UnitExists(b.unit) then
-            gone[#gone + 1] = b
-        elseif db.onlyAfflicted and RowLit(b) then
-            lit[#lit + 1] = b
-        else
-            rest[#rest + 1] = b
-        end
-    end
-    for _, b in ipairs(rest) do lit[#lit + 1] = b end
-    for _, b in ipairs(gone) do lit[#lit + 1] = b end
-    return lit
+-- Secure buttons are frozen in combat, which is why the click area never
+-- moves and the rows (plain frames the addon can move in combat) do.
+local clicker
+
+local function CreateButtons()
+    clicker = CreateFrame("Button", "PhantomCurseClickArea", frame, "SecureActionButtonTemplate")
+    clicker:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, -HEADER_H)
+    clicker:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, 0)
+    clicker:SetFrameLevel(frame:GetFrameLevel() + 1)
+    clicker:RegisterForClicks("AnyUp", "AnyDown")
+    SetMouse(clicker, false, false) -- switched on when there is something to click
+
+    -- Solo / party: you plus party1-4. Raid: raid1-40.
+    CreateUnitButton("player", false)
+    for i = 1, 4 do CreateUnitButton("party" .. i, false) end
+    for i = 1, 40 do CreateUnitButton("raid" .. i, true) end
 end
 
+-- Shows the rows for the people in your group right now. Plain frames, so
+-- this works in combat too.
+local function UpdateRowVisibility()
+    local raid = IsInRaid()
+    for _, b in ipairs(buttons) do
+        local show
+        if b.isRaid then
+            show = raid and UnitExists(b.unit)
+        else
+            show = not raid and (b.unit == "player" or UnitExists(b.unit))
+        end
+        show = show and true or false
+        if b:IsShown() ~= show then b:SetShown(show) end
+    end
+    MarkLayout()
+end
+
+-- The click area takes clicks only while there's a name to click. It can
+-- only be switched out of combat, so it's switched on as combat starts.
+local function UpdateClicker()
+    if not clicker or InCombatLockdown() then return end
+    SetMouse(clicker, (not db.onlyAfflicted or #litOrder > 0) and true or false, false)
+end
+
+-- Stacks the names from the top, straight under the title bar: the first
+-- person to get a removable debuff gets the top row, the next one the row
+-- below, and so on. Rows are plain frames, so this works in combat.
+-- In "names always shown" mode everyone is listed in group order.
 Relayout = function()
-    if InCombatLockdown() then layoutDirty = true return end
     layoutDirty = false
     if #buttons == 0 then return end
-    -- buttons 1-5: player + party1-4; buttons 6-45: raid1-40
-    for i, b in ipairs(Ordered(1, 5)) do Place(b, 0, i - 1) end
-    for i, b in ipairs(Ordered(6, #buttons)) do
-        Place(b, math.floor((i - 1) / RAID_ROWS), (i - 1) % RAID_ROWS)
+    local order, placed = {}, {}
+    if db.onlyAfflicted then
+        for _, b in ipairs(litOrder) do
+            if b:IsShown() then
+                order[#order + 1] = b
+                placed[b] = true
+            end
+        end
     end
+    for _, b in ipairs(buttons) do
+        if b:IsShown() and not placed[b] then order[#order + 1] = b end
+    end
+    for i, b in ipairs(order) do
+        pcall(Place, b, math.floor((i - 1) / RAID_ROWS), (i - 1) % RAID_ROWS)
+    end
+    UpdateClicker()
 end
 
 local function ApplySpells()
     activeSpells = FindSpells()
     BuildCurves()
-    for _, b in ipairs(buttons) do
-        for i, click in ipairs(CLICKS) do
-            local name = activeSpells[i]
-            b:SetAttribute(click.prefix .. "type" .. click.suffix, name and "spell" or nil)
-            b:SetAttribute(click.prefix .. "spell" .. click.suffix, name)
-        end
-        if #activeSpells == 0 then
-            b:SetAttribute("type1", "target")
-        end
+    if not clicker then return end
+    for i, click in ipairs(CLICKS) do
+        local name = activeSpells[i]
+        clicker:SetAttribute(click.prefix .. "type" .. click.suffix, name and "macro" or nil)
+        clicker:SetAttribute(click.prefix .. "macrotext" .. click.suffix,
+            name and ("/cast [@mouseover,help,nodead] " .. name) or nil)
+    end
+    if #activeSpells == 0 then
+        clicker:SetAttribute("type1", "macro")
+        clicker:SetAttribute("macrotext1", "/target [@mouseover,help]")
     end
 end
 
@@ -1460,6 +1520,7 @@ events:SetScript("OnEvent", function(_, event, arg1)
         filterOK = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
         spellsDirty = true
         CreateButtons()
+        UpdateRowVisibility()
         ApplySettings()
 
         -- Safety net in case an aura change arrives without an event. Only
@@ -1479,19 +1540,19 @@ events:SetScript("OnEvent", function(_, event, arg1)
         SafeRegister("UNIT_PET")
 
     elseif event == "PLAYER_REGEN_DISABLED" then
-        -- Last moment before the combat lock: make every row clickable so a
-        -- name that lights up mid-fight can be clicked.
-        for _, b in ipairs(buttons) do SetRowClickable(b, true) end
+        -- Last moment before the combat lock: switch the click area on so a
+        -- name that lights up mid-fight can be clicked. With no name under
+        -- the mouse, a click still casts nothing.
+        if clicker then SetMouse(clicker, true, false) end
 
     elseif event == "PLAYER_REGEN_ENABLED" then
         if pending then SecureRefresh() end
-        -- Combat made every row clickable; switch blank ones off right away,
-        -- including rows that are hidden now (UpdateButton skips those).
-        for _, b in ipairs(buttons) do UpdateClickable(b) end
+        UpdateClicker()
         MarkAllDirty()
 
     elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
         if event == "PLAYER_ENTERING_WORLD" then spellsDirty = true end
+        UpdateRowVisibility()
         RefreshContainers()
         SecureRefresh()
         MarkAllDirty()
