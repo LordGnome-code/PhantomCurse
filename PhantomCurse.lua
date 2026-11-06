@@ -123,6 +123,13 @@ local maskCurve                -- same, but invisible for types you can't remove
 local settings                 -- options window, built on first use
 local useContainers = true     -- game-drawn highlight available?
 local containerError           -- why not, if it isn't
+local flusher, Relayout        -- defined further down
+local layoutDirty = false      -- lit rows need moving to the top (out of combat)
+
+local function MarkLayout()
+    layoutDirty = true
+    if flusher then flusher:Show() end
+end
 
 local function Print(msg)
     print("|cff9d7dffPhantomCurse|r: " .. msg)
@@ -448,14 +455,8 @@ local function RowLit(b)
     if b.testUntil and GetTime() < b.testUntil then return true end
     if b.container then
         for _, btn in pairs(b.auraParts.btns) do
-            -- IsVisible (not IsShown) so a slot inside a hidden parent doesn't
-            -- count, and a slot faded to nothing doesn't count either.
-            local ok, lit = pcall(function()
-                if not btn:IsVisible() then return false end
-                local a = btn:GetEffectiveAlpha()
-                if issecret(a) then return true end
-                return a > 0.05
-            end)
+            -- IsVisible (not IsShown) so a slot inside a hidden parent doesn't count.
+            local ok, lit = pcall(btn.IsVisible, btn)
             if ok and lit then return true end
         end
         return false
@@ -474,6 +475,7 @@ local function SetRowClickable(b, on)
     end
     pcall(b.SetMouseMotionEnabled, b, false)
     b.clickable = on
+    MarkLayout() -- a row lit up or went blank: restack the names
 end
 
 -- Out of combat a row only takes clicks while a name is actually lit on it.
@@ -596,7 +598,7 @@ local function Touch(b)
     end
 end
 
-local flusher = CreateFrame("Frame")
+flusher = CreateFrame("Frame")
 flusher:Hide()
 flusher:SetScript("OnUpdate", function(self)
     self:Hide()
@@ -605,21 +607,22 @@ flusher:SetScript("OnUpdate", function(self)
         flushAll = false
         wipe(dirty)
         UpdateAll()
-        return
-    end
-    for unit in pairs(dirty) do
-        local b = byUnit[unit]
-        if b:IsVisible() then
-            Touch(b)
-        else
-            -- e.g. "player" or "party2" while in a raid: their rows are hidden,
-            -- so find the raid row showing the same person.
-            for _, rb in ipairs(buttons) do
-                if rb:IsVisible() and UnitIsUnit(rb.unit, unit) then Touch(rb) end
+    else
+        for unit in pairs(dirty) do
+            local b = byUnit[unit]
+            if b:IsVisible() then
+                Touch(b)
+            else
+                -- e.g. "player" or "party2" while in a raid: their rows are hidden,
+                -- so find the raid row showing the same person.
+                for _, rb in ipairs(buttons) do
+                    if rb:IsVisible() and UnitIsUnit(rb.unit, unit) then Touch(rb) end
+                end
             end
         end
+        wipe(dirty)
     end
-    wipe(dirty)
+    if layoutDirty and not InCombatLockdown() and Relayout then Relayout() end
 end)
 
 local function MarkDirty(unit)
@@ -681,12 +684,36 @@ end
 -- initializeFrame may run lazily, the first time a debuff actually lands,
 -- which can be mid-combat. So it fills in the name, letter and pulse itself
 -- from what is already known, instead of waiting for an out-of-combat update.
+-- The game's aura frames sit on top of the row. Aura buttons normally take
+-- the mouse (for tooltips), and the game can switch that back on whenever a
+-- debuff appears. If they did, they would swallow the click meant for the
+-- secure row underneath, so a lit name couldn't be clicked. Force them
+-- click-through, and keep forcing it if anything turns the mouse back on.
+local function MakeClickThrough(f)
+    if f.pcForcing then return end
+    f.pcForcing = true
+    pcall(f.SetMouseClickEnabled, f, false)
+    pcall(f.SetMouseMotionEnabled, f, false)
+    pcall(f.EnableMouse, f, false)
+    f.pcForcing = false
+    if not f.pcHooked then
+        f.pcHooked = true
+        local function reForce(self, on)
+            if on and not self.pcForcing then MakeClickThrough(self) end
+        end
+        for _, m in ipairs({ "EnableMouse", "SetMouseClickEnabled", "SetMouseMotionEnabled" }) do
+            if f[m] then pcall(hooksecurefunc, f, m, reForce) end
+        end
+    end
+end
+
 local function AttachContainer(b)
     local ok, err = pcall(function()
         local c = CreateFrame("AuraContainer", nil, b, "CustomAuraContainerTemplate")
         c:SetAllPoints(b)
         c:SetFrameLevel(b:GetFrameLevel() + 3)
         c:SetUnit(b.unit)
+        MakeClickThrough(c)
 
         local parts = { names = {}, letters = {}, pulses = {}, btns = {} }
         local sets, keys = SlotTypeSets()
@@ -699,7 +726,7 @@ local function AttachContainer(b)
                 initializeFrame = function(btn)
                     btn:ClearAllPoints()
                     btn:SetAllPoints(c)
-                    pcall(btn.EnableMouse, btn, false) -- clicks must reach the row
+                    MakeClickThrough(btn) -- clicks must reach the row
 
                     -- Fill, tinted by the game in the debuff type's colour.
                     local fill = btn:CreateTexture(nil, "BACKGROUND")
@@ -747,7 +774,10 @@ local function AttachContainer(b)
                     -- Sound and clickability follow this slot appearing.
                     parts.btns[slot] = btn
                     btn.pcWasShown = false
-                    btn:HookScript("OnShow", function(self) SlotChanged(b, self) end)
+                    btn:HookScript("OnShow", function(self)
+                        MakeClickThrough(self)
+                        SlotChanged(b, self)
+                    end)
                     btn:HookScript("OnHide", function(self) SlotChanged(b, self) end)
                     if btn:IsVisible() then SlotChanged(b, btn) end
                 end,
@@ -920,6 +950,42 @@ local function CreateButtons()
     end
 end
 
+-- Stacks lit names from the top, straight under the title bar, each new one
+-- below the last. Every row keeps a slot of its own (lit first, then the
+-- rest in group order) so nothing can ever overlap.
+--
+-- Secure rows can only be moved out of combat. In combat the game hides who
+-- has which debuff and locks the rows in place, so a name that lights up
+-- mid-fight shows in the slot it already had; the list restacks as soon as
+-- combat ends.
+local function Ordered(first, last)
+    local lit, rest, gone = {}, {}, {}
+    for i = first, last do
+        local b = buttons[i]
+        if not UnitExists(b.unit) then
+            gone[#gone + 1] = b
+        elseif db.onlyAfflicted and RowLit(b) then
+            lit[#lit + 1] = b
+        else
+            rest[#rest + 1] = b
+        end
+    end
+    for _, b in ipairs(rest) do lit[#lit + 1] = b end
+    for _, b in ipairs(gone) do lit[#lit + 1] = b end
+    return lit
+end
+
+Relayout = function()
+    if InCombatLockdown() then layoutDirty = true return end
+    layoutDirty = false
+    if #buttons == 0 then return end
+    -- buttons 1-5: player + party1-4; buttons 6-45: raid1-40
+    for i, b in ipairs(Ordered(1, 5)) do Place(b, 0, i - 1) end
+    for i, b in ipairs(Ordered(6, #buttons)) do
+        Place(b, math.floor((i - 1) / RAID_ROWS), (i - 1) % RAID_ROWS)
+    end
+end
+
 local function ApplySpells()
     activeSpells = FindSpells()
     BuildCurves()
@@ -985,6 +1051,7 @@ local function SecureRefresh()
     ResizeWindow()
     frame:SetScale(db.scale or 1)
     ApplyVisibility()
+    MarkLayout() -- group or display mode changed: restack on the next frame
 end
 
 local function ApplySettings()
