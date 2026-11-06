@@ -448,8 +448,15 @@ local function RowLit(b)
     if b.testUntil and GetTime() < b.testUntil then return true end
     if b.container then
         for _, btn in pairs(b.auraParts.btns) do
-            local ok, shown = pcall(btn.IsShown, btn)
-            if ok and shown then return true end
+            -- IsVisible (not IsShown) so a slot inside a hidden parent doesn't
+            -- count, and a slot faded to nothing doesn't count either.
+            local ok, lit = pcall(function()
+                if not btn:IsVisible() then return false end
+                local a = btn:GetEffectiveAlpha()
+                if issecret(a) then return true end
+                return a > 0.05
+            end)
+            if ok and lit then return true end
         end
         return false
     end
@@ -469,10 +476,14 @@ local function SetRowClickable(b, on)
     b.clickable = on
 end
 
+-- Out of combat a row only takes clicks while a name is actually lit on it.
+-- Hidden rows and rows with nobody in them are switched off too, so they
+-- don't come back clickable before UpdateButton has looked at them.
 local function UpdateClickable(b)
     if InCombatLockdown() then return end
-    local blank = b:IsVisible() and db.onlyAfflicted and not RowLit(b)
-    SetRowClickable(b, not blank)
+    local on = not db.onlyAfflicted
+        or (b:IsVisible() and UnitExists(b.unit) and RowLit(b))
+    SetRowClickable(b, on and true or false)
 end
 
 -- Called when one of the game's aura slots on a row appears or disappears.
@@ -499,6 +510,7 @@ local function UpdateButton(b)
     local unit = b.unit
     if not UnitExists(unit) then
         ClearHighlight(b)
+        UpdateClickable(b)
         return
     end
 
@@ -1406,6 +1418,9 @@ events:SetScript("OnEvent", function(_, event, arg1)
 
     elseif event == "PLAYER_REGEN_ENABLED" then
         if pending then SecureRefresh() end
+        -- Combat made every row clickable; switch blank ones off right away,
+        -- including rows that are hidden now (UpdateButton skips those).
+        for _, b in ipairs(buttons) do UpdateClickable(b) end
         MarkAllDirty()
 
     elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
