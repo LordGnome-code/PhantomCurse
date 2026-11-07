@@ -106,6 +106,7 @@ local DEFAULTS = {
     hidden = false,
     allTypes = false,          -- highlight every typed debuff, removable or not
     onlyAfflicted = true,      -- Decursive-style: names only when removable
+    attachClicks = true,       -- click buttons inside the game's debuff frame (stacking + click-through)
     scale = 1,
     alpha = 0.85,
 }
@@ -463,11 +464,13 @@ local function UpdateButton(b)
     b.displayName = text
     b.name:SetText(text)
 
-    -- The name inside the game-drawn highlight. Only rewritten when it
-    -- changes, and only out of combat (the game locks that frame in combat).
-    if b.slotName and b.slotText ~= text and not InCombatLockdown() then
-        pcall(b.slotName.SetText, b.slotName, text)
-        b.slotText = text
+    -- Text updates may be allowed even while the aura frame's layout is
+    -- locked. Try in combat too, so members joining then don't stay unnamed.
+    -- Cache only successful writes; rejected writes must be retried.
+    if b.slotName and b.slotText ~= text then
+        local ok, err = pcall(b.slotName.SetText, b.slotName, text)
+        if ok then b.slotText = text end
+        b.slotNameError = not ok and tostring(err) or nil
     end
 
     -- Rows with the game-drawn highlight don't need the addon's own scan.
@@ -644,6 +647,7 @@ local function AttachContainer(b)
         local c = CreateFrame("AuraContainer", nil, b, "CustomAuraContainerTemplate")
         c:SetAllPoints(b)
         c:SetFrameLevel(b:GetFrameLevel() + 3)
+        c:SetUnit(b.unit) -- same order as the version where names showed correctly
         pcall(c.EnableMouse, c, false)
 
         local set, key = SlotTypes()
@@ -702,8 +706,6 @@ local function AttachContainer(b)
         })
         if type(ab) == "table" and not b.auraButton then b.auraButton = ab end
 
-        -- Unit goes on after the slots, so the container listens for them.
-        c:SetUnit(b.unit)
         pcall(c.UpdateAllAuras, c)
 
         b.container = c
@@ -722,7 +724,7 @@ end
 -- be re-parented in combat.
 local function AttachClick(b)
     if InCombatLockdown() then return end
-    local want = (db.onlyAfflicted and b.auraButton) or b
+    local want = (db.attachClicks and db.onlyAfflicted and b.auraButton) or b
     if b.clickParent == want then return end
     if not pcall(b.click.SetParent, b.click, want) then
         want = b
@@ -1302,6 +1304,16 @@ local function Debug()
     local v1, v2, v3 = VersionInfo()
     Print(v1 .. " | " .. v2)
     Print(v3 .. (containerError and (" - " .. containerError) or ""))
+    for _, b in ipairs(buttons) do
+        if b:IsVisible() and UnitExists(b.unit) then
+            local ok, visible = pcall(function()
+                return tostring(b.auraButton and b.auraButton:IsVisible() or false)
+            end)
+            Print("  " .. b.unit .. " | aura frame: " .. (ok and visible or "restricted")
+                .. " | name: " .. tostring(b.slotText or "not updated")
+                .. (b.slotNameError and (" | name update failed: " .. b.slotNameError) or ""))
+        end
+    end
     for i, name in ipairs(activeSpells) do
         local types = {}
         for _, t in ipairs(TYPE_ORDER) do
@@ -1386,6 +1398,15 @@ SlashCmdList.PHANTOMCURSE = function(msg)
         Print(v1 .. " | " .. v2 .. " | " .. v3)
     elseif msg == "why" then
         Why()
+    elseif msg == "attach" then
+        if InCombatLockdown() then
+            Print("can't change that in combat.")
+        else
+            db.attachClicks = not db.attachClicks
+            SecureRefresh()
+            Print("click buttons inside the debuff frame: " .. (db.attachClicks and "ON (rows stack, blank rows click-through)."
+                or "OFF (fixed rows, every row clickable)."))
+        end
     elseif msg == "debug" then
         Debug()
     elseif msg == "spells" then
@@ -1397,7 +1418,7 @@ SlashCmdList.PHANTOMCURSE = function(msg)
             end
         end
     else
-        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | test | spells | version | debug | why")
+        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | test | spells | version | debug | why | attach")
     end
 end
 
@@ -1414,7 +1435,7 @@ events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 
 events:SetScript("OnEvent", function(_, event, arg1)
-    if event == "UNIT_AURA" then
+    if event == "UNIT_AURA" or event == "UNIT_NAME_UPDATE" then
         MarkDirty(arg1)
 
     elseif event == "ADDON_LOADED" then
@@ -1445,6 +1466,7 @@ events:SetScript("OnEvent", function(_, event, arg1)
         end)
 
         SafeRegister("UNIT_AURA")
+        SafeRegister("UNIT_NAME_UPDATE")
         SafeRegister("GROUP_ROSTER_UPDATE")
         SafeRegister("PLAYER_ENTERING_WORLD")
         SafeRegister("PLAYER_REGEN_ENABLED")
