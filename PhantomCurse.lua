@@ -1,12 +1,14 @@
 -- PhantomCurse: click-to-cleanse window for WoW: Forever (12.x UI engine).
 --
 -- How it works on this client:
---  * Each group member gets a plain display row. Secure (click-to-cast)
---    buttons cannot be moved, shown or hidden in combat, so the rows are NOT
---    secure: that lets the names stack from the top in the order people got
---    a removable debuff, in combat too. Clicks go to one secure click area
---    behind the rows that casts on the "mouseover" unit; hovering a lit name
---    makes that person the mouseover (through the unit tooltip).
+--  * Each group member gets a secure row with a secure click button that
+--    casts your dispel on them. The click button sits INSIDE the game's own
+--    debuff frame for that person, so it only exists (and only takes clicks)
+--    while they have a debuff you can remove. Blank rows are invisible and
+--    clicks pass straight through them.
+--  * A secure snippet (which the game runs even in combat) restacks the rows
+--    whenever a click button appears or disappears: rows with a name go to
+--    the top, one under the other. The addon never reads who is debuffed.
 --  * The window's own visibility (closed, hide out of combat, hide when solo)
 --    is also a state driver, so it can appear the instant combat starts.
 --  * In combat the client hides all aura data from addon code ("secret
@@ -125,13 +127,6 @@ local maskCurve                -- same, but invisible for types you can't remove
 local settings                 -- options window, built on first use
 local useContainers = true     -- game-drawn highlight available?
 local containerError           -- why not, if it isn't
-local flusher, Relayout        -- defined further down
-local layoutDirty = false      -- lit rows need moving to the top (out of combat)
-
-local function MarkLayout()
-    layoutDirty = true
-    if flusher then flusher:Show() end
-end
 
 local function Print(msg)
     print("|cff9d7dffPhantomCurse|r: " .. msg)
@@ -439,7 +434,7 @@ local function ClearHighlight(b)
 end
 
 ---------------------------------------------------------------------------
--- Alert sound, lit order and hovering
+-- Alert sound
 ---------------------------------------------------------------------------
 local function PlayAlert()
     if not db.sound then return end
@@ -449,75 +444,10 @@ local function PlayAlert()
     PlaySound(SOUNDKIT and SOUNDKIT.RAID_WARNING or 8959, "Master")
 end
 
--- Is a name actually lit up on this row right now? With the game-drawn
--- highlight that means one of its aura slots is showing, which is exactly
--- what you see, so the sound and the clickable area can never disagree with
--- the window.
-local function RowLit(b)
-    if b.testUntil and GetTime() < b.testUntil then return true end
-    if b.container then
-        for _, btn in pairs(b.auraParts.btns) do
-            -- IsVisible (not IsShown) so a slot inside a hidden parent doesn't count.
-            local ok, lit = pcall(btn.IsVisible, btn)
-            if ok and lit then return true end
-        end
-        return false
-    end
-    return b.afflicted and true or false
-end
-
--- Rows lit right now, in the order they lit up. The first one sits in the
--- top row under the title bar, each later one in the next row down.
-local litOrder = {}
-
-local function SetLit(b, lit)
-    lit = lit and true or false
-    if b.lit == lit then return end
-    b.lit = lit
-    for i = #litOrder, 1, -1 do
-        if litOrder[i] == b then table.remove(litOrder, i) end
-    end
-    if lit then litOrder[#litOrder + 1] = b end
-    MarkLayout()
-end
-
--- Hovering a lit name makes that person the game's "mouseover" unit (the
--- unit tooltip does that), and the click area behind the list casts on the
--- mouseover unit. Moving off the name clears it again.
-local function HoverEnter(unit, owner)
-    if not UnitExists(unit) then return end
-    GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
-    GameTooltip:SetUnit(unit)
-    GameTooltip:Show()
-end
-local function HoverLeave()
-    GameTooltip:Hide()
-end
-
--- Sets whether a display frame takes clicks and/or hover. Display frames
--- never take clicks (those go to the click area underneath).
-local function SetMouse(f, click, motion)
-    if not pcall(f.SetMouseClickEnabled, f, click) then
-        pcall(f.EnableMouse, f, click or motion)
-    end
-    pcall(f.SetMouseMotionEnabled, f, motion)
-end
-
--- Called when one of the game's aura slots on a row appears or disappears.
--- OnShow also fires when the window or row reappears, so the sound only plays
--- when the slot itself has just turned on and the row wasn't already lit.
-local function SlotChanged(b, btn)
-    local ok, own = pcall(btn.IsShown, btn)
-    own = ok and own or false
-    local fresh = own and not btn.pcWasShown
-    btn.pcWasShown = own
-    local wasLit = b.lit
-    SetLit(b, RowLit(b))
-    if fresh and not wasLit and btn:IsVisible() then
-        PlayAlert()
-    end
-end
-
+-- Draws the parts of a row the addon itself controls: the name in "names
+-- always shown" mode, the test highlight, and the fallback highlight on
+-- clients without the game-drawn one. The game-drawn highlight needs none of
+-- this: the game shows and hides it by itself, in or out of combat.
 local function UpdateButton(b)
     -- Rows the game has hidden (party rows in a raid, empty raid slots, or
     -- the whole window) are skipped; OnShow refreshes them when they return.
@@ -526,7 +456,6 @@ local function UpdateButton(b)
     local unit = b.unit
     if not UnitExists(unit) then
         ClearHighlight(b)
-        SetLit(b, false)
         return
     end
 
@@ -534,24 +463,20 @@ local function UpdateButton(b)
     b.displayName = text
     b.name:SetText(text)
 
-    -- Rows with the game-drawn highlight don't need the addon's own scan.
-    local aura = not b.container and FindDispellable(unit)
-    local testing = b.testUntil and GetTime() < b.testUntil
-    -- When the game draws the highlight, the addon only draws its own for
-    -- the "Test highlight" button.
-    local detected = testing or (not b.container and aura)
-    local layered = false
-
-    -- Names inside the game-drawn highlight. Only rewritten when they change,
-    -- and only out of combat (the game locks those frames in combat).
-    if b.auraParts and b.slotText ~= text and not InCombatLockdown() then
-        for _, fs in pairs(b.auraParts.names) do
-            pcall(fs.SetText, fs, text)
-        end
+    -- The name inside the game-drawn highlight. Only rewritten when it
+    -- changes, and only out of combat (the game locks that frame in combat).
+    if b.slotName and b.slotText ~= text and not InCombatLockdown() then
+        pcall(b.slotName.SetText, b.slotName, text)
         b.slotText = text
     end
 
-    -- Fallback rows only; game-drawn rows play the sound from SlotChanged.
+    -- Rows with the game-drawn highlight don't need the addon's own scan.
+    local aura = not b.container and FindDispellable(unit)
+    local testing = b.testUntil and GetTime() < b.testUntil
+    local detected = testing or (not b.container and aura)
+    local layered = false
+
+    -- Fallback rows only; game-drawn rows play the sound from their click button.
     if not b.container then
         if aura and not b.afflicted then PlayAlert() end
         b.afflicted = aura and true or false
@@ -587,14 +512,6 @@ local function UpdateButton(b)
     else
         b.pulse:Stop()
     end
-
-    -- The row itself only reacts to hovering when its name is drawn by the
-    -- addon (names-always-shown mode, the test highlight, or the fallback
-    -- highlight). Game-drawn names handle hovering on their own slot frames,
-    -- which only exist while the debuff does.
-    SetMouse(b, false, (showRow or layered) and true or false)
-
-    SetLit(b, RowLit(b))
 end
 
 local function UpdateAll()
@@ -618,7 +535,7 @@ local function Touch(b)
     end
 end
 
-flusher = CreateFrame("Frame")
+local flusher = CreateFrame("Frame")
 flusher:Hide()
 flusher:SetScript("OnUpdate", function(self)
     self:Hide()
@@ -627,22 +544,21 @@ flusher:SetScript("OnUpdate", function(self)
         flushAll = false
         wipe(dirty)
         UpdateAll()
-    else
-        for unit in pairs(dirty) do
-            local b = byUnit[unit]
-            if b:IsVisible() then
-                Touch(b)
-            else
-                -- e.g. "player" or "party2" while in a raid: their rows are hidden,
-                -- so find the raid row showing the same person.
-                for _, rb in ipairs(buttons) do
-                    if rb:IsVisible() and UnitIsUnit(rb.unit, unit) then Touch(rb) end
-                end
+        return
+    end
+    for unit in pairs(dirty) do
+        local b = byUnit[unit]
+        if b:IsVisible() then
+            Touch(b)
+        else
+            -- e.g. "player" or "party2" while in a raid: their rows are hidden,
+            -- so find the raid row showing the same person.
+            for _, rb in ipairs(buttons) do
+                if rb:IsVisible() and UnitIsUnit(rb.unit, unit) then Touch(rb) end
             end
         end
-        wipe(dirty)
     end
-    if layoutDirty and Relayout then Relayout() end
+    wipe(dirty)
 end)
 
 local function MarkDirty(unit)
@@ -657,165 +573,141 @@ local function MarkAllDirty()
 end
 
 ---------------------------------------------------------------------------
--- Secure unit buttons
+-- Rows, click buttons and stacking
 ---------------------------------------------------------------------------
--- The game-drawn highlight has one aura slot per click (left, right, middle,
--- shift+left) plus a spare. Each slot only accepts the debuff types that
--- click's spell removes, so the letter on the highlight tells you which click
--- to use. A type is given to the first click that can remove it. The spare
--- slot takes whatever is left when "highlight all types" is on or no dispel
--- spell could be detected.
-local N_SLOTS = 5
-local SLOT_LETTERS = { "L", "R", "M", "S", "" }
+-- Each group member has:
+--  * a row: a secure frame, so a secure snippet may move it even in combat;
+--  * an AuraContainer on the row: the game shows its debuff frame only while
+--    that person has a debuff you can remove, and draws the highlight in it;
+--  * a click button (secure) placed INSIDE that debuff frame. A frame inside
+--    a hidden frame is hidden too, so the click button only exists while the
+--    debuff does. With no debuff there is nothing there to click: the row is
+--    invisible and clicks go straight through to the world.
+--
+-- Stacking: the game runs the STACK snippet whenever a click button appears
+-- or disappears (in combat too). It moves every row whose click button is
+-- showing to the top of the list, one under the other, in group order.
+-- The addon never reads who has a debuff; it only reacts to the game showing
+-- or hiding its own frame.
 
-local function LetterFor(slot)
-    return #activeSpells > 1 and SLOT_LETTERS[slot] or ""
+local function Place(b, col, row)
+    b:ClearAllPoints()
+    b:SetPoint("TOPLEFT", frame, "TOPLEFT",
+        PAD + col * (BTN_W + PAD),
+        -(HEADER_H + PAD + row * (BTN_H + PAD)))
 end
 
-local function SlotTypeSets()
-    local sets, keys, covered = {}, {}, {}
-    for i = 1, N_SLOTS - 1 do
-        local set, key = {}, ""
-        for _, dtype in ipairs(TYPE_ORDER) do
-            if spellTypes[i] and spellTypes[i][dtype] and not covered[dtype] then
-                set[dtype] = true
-                covered[dtype] = true
-                key = key .. dtype
+local STACK = [[
+    local header = self:GetFrameRef("pc-header")
+    if not header then return end
+    local n = header:GetAttribute("pc-n") or 0
+    local per = header:GetAttribute("pc-per") or 10
+    local w = header:GetAttribute("pc-w") or 120
+    local h = header:GetAttribute("pc-h") or 18
+    local pad = header:GetAttribute("pc-pad") or 2
+    local top = header:GetAttribute("pc-top") or 16
+    local col, r = 0, 0
+    for i = 1, n do
+        local row = header:GetFrameRef("pc-row" .. i)
+        local click = header:GetFrameRef("pc-click" .. i)
+        if row and click and click:IsVisible() then
+            row:ClearAllPoints()
+            row:SetPoint("TOPLEFT", header, "TOPLEFT",
+                pad + col * (w + pad), -(top + pad + r * (h + pad)))
+            r = r + 1
+            if r >= per then
+                r = 0
+                col = col + 1
             end
         end
-        sets[i], keys[i] = set, key
     end
+]]
+
+-- The debuff types to highlight, as an AuraContainer filter set.
+local function SlotTypes()
     local set, key = {}, ""
     for _, dtype in ipairs(TYPE_ORDER) do
-        if not covered[dtype] and Removable(dtype) then
+        if Removable(dtype) then
             set[dtype] = true
             key = key .. dtype
         end
     end
-    sets[N_SLOTS], keys[N_SLOTS] = set, key
-    return sets, keys
+    return set, key
 end
 
 -- Builds the game-drawn highlight for one row: an AuraContainer watching the
--- row's unit. Each slot's button fills the row and is shown/hidden by the
--- game, so it works in combat. Everything drawn inside it (fill, outline,
--- name, click letter) appears and disappears with it.
---
--- initializeFrame may run lazily, the first time a debuff actually lands,
--- which can be mid-combat. So it fills in the name, letter and pulse itself
--- from what is already known, instead of waiting for an out-of-combat update.
--- The game's aura frames sit on top of the click area. They must never take
--- clicks (the click has to fall through to the click area underneath), and
--- the slot frames must take hovering (that is what picks who gets cast on).
--- The game can change a frame's mouse settings when a debuff appears, so the
--- wanted settings are re-applied whenever anything changes them.
-local function ForceMouse(f, click, motion)
-    if f.pcForcing then return end
-    f.pcWant = { click, motion }
-    f.pcForcing = true
-    SetMouse(f, click, motion)
-    f.pcForcing = false
-    if not f.pcHooked then
-        f.pcHooked = true
-        local function reForce(self)
-            if not self.pcForcing and self.pcWant then
-                ForceMouse(self, self.pcWant[1], self.pcWant[2])
-            end
-        end
-        for _, m in ipairs({ "EnableMouse", "SetMouseClickEnabled", "SetMouseMotionEnabled" }) do
-            if f[m] then pcall(hooksecurefunc, f, m, reForce) end
-        end
-    end
-end
-
+-- row's unit with one debuff slot. Everything drawn inside the slot's frame
+-- (fill, outline, name) appears and disappears with it. Setup must happen in
+-- initializeFrame: the game locks the frame's own methods afterwards.
 local function AttachContainer(b)
     local ok, err = pcall(function()
         local c = CreateFrame("AuraContainer", nil, b, "CustomAuraContainerTemplate")
         c:SetAllPoints(b)
         c:SetFrameLevel(b:GetFrameLevel() + 3)
-        c:SetUnit(b.unit)
-        ForceMouse(c, false, false)
+        pcall(c.EnableMouse, c, false)
 
-        local parts = { names = {}, letters = {}, pulses = {}, btns = {} }
-        local sets, keys = SlotTypeSets()
+        local set, key = SlotTypes()
         local styles = Enum and Enum.CustomAuraButtonDispelTypeTextureStyle
         local preserve = styles and styles.PreserveAsset or 3
 
-        for slot = 1, N_SLOTS do
-            c:AddAuraSlot("dispel" .. slot, "HARMFUL", {
-                candidateFilters = { includeDispelTypes = sets[slot] },
-                initializeFrame = function(btn)
-                    btn:ClearAllPoints()
-                    btn:SetAllPoints(c)
-                    -- Hover picks the person; clicks fall through to the click area.
-                    ForceMouse(btn, false, true)
-                    pcall(btn.SetScript, btn, "OnEnter", function(self) HoverEnter(b.unit, self) end)
-                    pcall(btn.SetScript, btn, "OnLeave", HoverLeave)
+        local function init(btn)
+            b.auraButton = b.auraButton or btn
+            btn:ClearAllPoints()
+            btn:SetAllPoints(c)
+            -- The debuff frame itself never takes the mouse; the click button
+            -- inside it does.
+            pcall(btn.SetMouseClickEnabled, btn, false)
+            pcall(btn.SetMouseMotionEnabled, btn, false)
+            pcall(btn.EnableMouse, btn, false)
 
-                    -- Fill, tinted by the game in the debuff type's colour.
-                    local fill = btn:CreateTexture(nil, "BACKGROUND")
-                    fill:SetAllPoints()
-                    fill:SetTexture("Interface\\Buttons\\WHITE8x8")
-                    fill:SetVertexColor(1, 0.1, 0.1)
-                    pcall(btn.AddDispelTypeTexture, btn, fill, { style = preserve })
+            -- Fill, tinted by the game in the debuff type's colour.
+            local fill = btn:CreateTexture(nil, "BACKGROUND")
+            fill:SetAllPoints()
+            fill:SetTexture("Interface\\Buttons\\WHITE8x8")
+            fill:SetVertexColor(1, 0.1, 0.1)
+            pcall(btn.AddDispelTypeTexture, btn, fill, { style = preserve })
 
-                    for i = 1, 4 do
-                        local e = btn:CreateTexture(nil, "BORDER")
-                        e:SetColorTexture(1, 1, 1, 0.9)
-                        if i == 1 then e:SetPoint("TOPLEFT"); e:SetPoint("TOPRIGHT"); e:SetHeight(1)
-                        elseif i == 2 then e:SetPoint("BOTTOMLEFT"); e:SetPoint("BOTTOMRIGHT"); e:SetHeight(1)
-                        elseif i == 3 then e:SetPoint("TOPLEFT"); e:SetPoint("BOTTOMLEFT"); e:SetWidth(1)
-                        else e:SetPoint("TOPRIGHT"); e:SetPoint("BOTTOMRIGHT"); e:SetWidth(1) end
-                    end
+            for i = 1, 4 do
+                local e = btn:CreateTexture(nil, "BORDER")
+                e:SetColorTexture(1, 1, 1, 0.9)
+                if i == 1 then e:SetPoint("TOPLEFT"); e:SetPoint("TOPRIGHT"); e:SetHeight(1)
+                elseif i == 2 then e:SetPoint("BOTTOMLEFT"); e:SetPoint("BOTTOMRIGHT"); e:SetHeight(1)
+                elseif i == 3 then e:SetPoint("TOPLEFT"); e:SetPoint("BOTTOMLEFT"); e:SetWidth(1)
+                else e:SetPoint("TOPRIGHT"); e:SetPoint("BOTTOMRIGHT"); e:SetWidth(1) end
+            end
 
-                    local fs = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-                    fs:SetPoint("LEFT", 4, 0)
-                    fs:SetPoint("RIGHT", -14, 0)
-                    fs:SetJustifyH("LEFT")
-                    fs:SetWordWrap(false)
-                    fs:SetText(b.displayName or GetUnitName(b.unit, false) or "")
-                    parts.names[slot] = fs
+            local fs = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            fs:SetPoint("LEFT", 4, 0)
+            fs:SetPoint("RIGHT", -4, 0)
+            fs:SetJustifyH("LEFT")
+            fs:SetWordWrap(false)
+            fs:SetText(b.displayName or GetUnitName(b.unit, false) or "")
+            b.slotName = fs
 
-                    -- Which click removes it. Each slot's letter has its own
-                    -- spot so two can show at once.
-                    local letter = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-                    letter:SetPoint("RIGHT", -3 - (slot - 1) * 9, 0)
-                    letter:SetTextColor(1, 1, 0.4)
-                    letter:SetText(LetterFor(slot))
-                    parts.letters[slot] = letter
-
-                    local ag = fill:CreateAnimationGroup()
-                    local fade = ag:CreateAnimation("Alpha")
-                    fade:SetFromAlpha(1)
-                    fade:SetToAlpha(0.4)
-                    fade:SetDuration(0.45)
-                    ag:SetLooping("BOUNCE")
-                    if db.pulse then
-                        pcall(btn.AddAuraShownAnimation, btn, ag)
-                    end
-                    parts.pulses[slot] = { btn = btn, ag = ag, on = db.pulse }
-
-                    -- Sound and clickability follow this slot appearing.
-                    parts.btns[slot] = btn
-                    btn.pcWasShown = false
-                    btn:HookScript("OnShow", function(self)
-                        ForceMouse(self, false, true)
-                        SlotChanged(b, self)
-                    end)
-                    btn:HookScript("OnHide", function(self)
-                        -- The name vanished under the mouse: drop the mouseover
-                        -- so a click on the empty spot can't cast on them.
-                        if GameTooltip:IsOwned(self) then HoverLeave() end
-                        SlotChanged(b, self)
-                    end)
-                    if btn:IsVisible() then SlotChanged(b, btn) end
-                end,
-            })
+            local ag = fill:CreateAnimationGroup()
+            local fade = ag:CreateAnimation("Alpha")
+            fade:SetFromAlpha(1)
+            fade:SetToAlpha(0.4)
+            fade:SetDuration(0.45)
+            ag:SetLooping("BOUNCE")
+            if db.pulse then
+                pcall(btn.AddAuraShownAnimation, btn, ag)
+            end
+            b.slotPulse = { btn = btn, ag = ag, on = db.pulse }
         end
 
+        local ab = c:AddAuraSlot("dispel", "HARMFUL", {
+            candidateFilters = { includeDispelTypes = set },
+            initializeFrame = init,
+        })
+        if type(ab) == "table" and not b.auraButton then b.auraButton = ab end
+
+        -- Unit goes on after the slots, so the container listens for them.
+        c:SetUnit(b.unit)
+        pcall(c.UpdateAllAuras, c)
+
         b.container = c
-        b.auraParts = parts
-        b.filterKeys = keys
+        b.filterKey = key
     end)
     if not ok then
         b.container = nil
@@ -824,34 +716,48 @@ local function AttachContainer(b)
     end
 end
 
+-- Puts the click button inside the debuff frame ("names only when
+-- removable"), or on the row itself ("names always shown", or when the
+-- debuff frame isn't available). Out of combat only: secure buttons can't
+-- be re-parented in combat.
+local function AttachClick(b)
+    if InCombatLockdown() then return end
+    local want = (db.onlyAfflicted and b.auraButton) or b
+    if b.clickParent == want then return end
+    if not pcall(b.click.SetParent, b.click, want) then
+        want = b
+        b.click:SetParent(b)
+    end
+    b.clickParent = want
+    b.attached = want ~= b
+    b.click:ClearAllPoints()
+    b.click:SetAllPoints(b)
+    local okL, lvl = pcall(want.GetFrameLevel, want)
+    b.click:SetFrameLevel(((okL and lvl) or b:GetFrameLevel()) + 10)
+end
+
 -- Keeps the game-drawn highlight in step with your spells and settings.
--- Out of combat only: the game locks these frames while aura data is secret.
+-- Out of combat only.
 local function UpdateContainers()
-    local sets, keys = SlotTypeSets()
+    local set, key = SlotTypes()
     for _, b in ipairs(buttons) do
         if b.container then
-            local parts = b.auraParts
-            for slot = 1, N_SLOTS do
-                if b.filterKeys[slot] ~= keys[slot] then
-                    local ok = pcall(b.container.SetAuraSlotCandidateFilters, b.container,
-                        "dispel" .. slot, { includeDispelTypes = sets[slot] })
-                    if ok then b.filterKeys[slot] = keys[slot] end
+            if b.filterKey ~= key then
+                local ok = pcall(b.container.SetAuraSlotCandidateFilters, b.container,
+                    "dispel", { includeDispelTypes = set })
+                if ok then b.filterKey = key end
+            end
+            local pulse = b.slotPulse
+            if pulse and pulse.on ~= db.pulse then
+                pcall(pulse.btn.RemoveAuraShownAnimation, pulse.btn, pulse.ag)
+                pcall(pulse.ag.Stop, pulse.ag)
+                if db.pulse then
+                    pcall(pulse.btn.AddAuraShownAnimation, pulse.btn, pulse.ag)
                 end
-                local letter = parts.letters[slot]
-                if letter then
-                    pcall(letter.SetText, letter, LetterFor(slot))
-                end
-                local pulse = parts.pulses[slot]
-                if pulse and pulse.on ~= db.pulse then
-                    pcall(pulse.btn.RemoveAuraShownAnimation, pulse.btn, pulse.ag)
-                    pcall(pulse.ag.Stop, pulse.ag)
-                    if db.pulse then
-                        pcall(pulse.btn.AddAuraShownAnimation, pulse.btn, pulse.ag)
-                    end
-                    pulse.on = db.pulse
-                end
+                pulse.on = db.pulse
             end
         end
+        AttachClick(b)
     end
 end
 
@@ -865,24 +771,19 @@ local function RefreshContainers()
     end
 end
 
--- Each person gets a plain display row (not a secure button), so the addon
--- can move and hide rows freely, even in combat. Clicks are handled by one
--- secure click area behind all the rows; see CreateButtons.
-local function CreateUnitButton(unit, isRaid)
-    local b = CreateFrame("Frame", "PhantomCurseRow_" .. unit, frame)
+local function CreateUnitButton(unit, visibility)
+    local b = CreateFrame("Frame", "PhantomCurseRow_" .. unit, frame, "SecureHandlerBaseTemplate")
     b:SetSize(BTN_W, BTN_H)
-    b:SetFrameLevel(frame:GetFrameLevel() + 5) -- above the click area
     b.unit = unit
-    b.isRaid = isRaid
-    b:Hide()
 
     local bg = b:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints()
     bg:SetColorTexture(0.12, 0.10, 0.16, 0.9)
     b.bg = bg
 
-    -- Highlight: coloured fill that pulses, plus a bright outline. The fill
-    -- lives in its own frame so the whole thing can pulse together.
+    -- Addon-drawn highlight (test / fallback): coloured fill that pulses,
+    -- plus a bright outline. The fill lives in its own frame so the whole
+    -- thing can pulse together.
     local hlf = CreateFrame("Frame", nil, b)
     hlf:SetAllPoints()
     hlf:SetFrameLevel(b:GetFrameLevel() + 1)
@@ -940,12 +841,6 @@ local function CreateUnitButton(unit, isRaid)
     b.edges[3]:SetPoint("TOPLEFT");    b.edges[3]:SetPoint("BOTTOMLEFT");  b.edges[3]:SetWidth(1)
     b.edges[4]:SetPoint("TOPRIGHT");   b.edges[4]:SetPoint("BOTTOMRIGHT"); b.edges[4]:SetWidth(1)
 
-    -- Rows never take clicks. They only take hovering while their name is
-    -- drawn (UpdateButton decides), so blank rows can't be picked.
-    SetMouse(b, false, false)
-    b:SetScript("OnEnter", function(self) HoverEnter(self.unit, self) end)
-    b:SetScript("OnLeave", HoverLeave)
-
     local name = top:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     name:SetPoint("LEFT", 4, 0)
     name:SetPoint("RIGHT", -4, 0)
@@ -953,111 +848,75 @@ local function CreateUnitButton(unit, isRaid)
     name:SetWordWrap(false)
     b.name = name
 
+    -- The click button: casts your dispel on this person. It has no
+    -- textures of its own, so it is invisible; AttachClick decides where it
+    -- lives (inside the debuff frame, or on the row).
+    local click = CreateFrame("Button", "PhantomCurseButton_" .. unit, b, "SecureActionButtonTemplate")
+    click:SetAllPoints(b)
+    click:SetFrameLevel(b:GetFrameLevel() + 10)
+    click:RegisterForClicks("AnyUp", "AnyDown")
+    click:SetAttribute("unit", unit)
+    pcall(click.SetMouseMotionEnabled, click, false) -- no hover effects
+    b.click = click
+
     if useContainers then AttachContainer(b) end
 
     b:SetScript("OnShow", UpdateButton)
-    b:SetScript("OnHide", function(self)
-        if GameTooltip:IsOwned(self) then HoverLeave() end
-        SetLit(self, false)
-    end)
+    RegisterStateDriver(b, "visibility", visibility)
 
     buttons[#buttons + 1] = b
     byUnit[unit] = b
+
+    -- Stacking: the game runs STACK whenever this click button appears or
+    -- disappears, in or out of combat.
+    local i = #buttons
+    frame:SetFrameRef("pc-row" .. i, b)
+    frame:SetFrameRef("pc-click" .. i, click)
+    click:SetFrameRef("pc-header", frame)
+    SecureHandlerWrapScript(click, "OnShow", frame, STACK)
+    SecureHandlerWrapScript(click, "OnHide", frame, STACK)
+
+    -- Alert sound when a name appears (game-drawn highlight only).
+    click:HookScript("OnShow", function()
+        if b.attached then PlayAlert() end
+    end)
     return b
 end
 
-local function Place(b, col, row)
-    b:ClearAllPoints()
-    b:SetPoint("TOPLEFT", frame, "TOPLEFT",
-        PAD + col * (BTN_W + PAD),
-        -(HEADER_H + PAD + row * (BTN_H + PAD)))
-end
-
--- The click area: one secure button covering the list, behind the rows. It
--- casts on the "mouseover" unit, which is whoever's lit name the mouse is on
--- (see HoverEnter). Over an empty spot there is no mouseover, and the macro's
--- [@mouseover,help,nodead] check means nothing is cast.
---
--- Secure buttons are frozen in combat, which is why the click area never
--- moves and the rows (plain frames the addon can move in combat) do.
-local clicker
-
 local function CreateButtons()
-    clicker = CreateFrame("Button", "PhantomCurseClickArea", frame, "SecureActionButtonTemplate")
-    clicker:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, -HEADER_H)
-    clicker:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 0, 0)
-    clicker:SetFrameLevel(frame:GetFrameLevel() + 1)
-    clicker:RegisterForClicks("AnyUp", "AnyDown")
-    SetMouse(clicker, false, false) -- switched on when there is something to click
-
-    -- Solo / party: you plus party1-4. Raid: raid1-40.
-    CreateUnitButton("player", false)
-    for i = 1, 4 do CreateUnitButton("party" .. i, false) end
-    for i = 1, 40 do CreateUnitButton("raid" .. i, true) end
-end
-
--- Shows the rows for the people in your group right now. Plain frames, so
--- this works in combat too.
-local function UpdateRowVisibility()
-    local raid = IsInRaid()
-    for _, b in ipairs(buttons) do
-        local show
-        if b.isRaid then
-            show = raid and UnitExists(b.unit)
-        else
-            show = not raid and (b.unit == "player" or UnitExists(b.unit))
-        end
-        show = show and true or false
-        if b:IsShown() ~= show then b:SetShown(show) end
+    -- Starting spots. Rows with a name showing are restacked from the top by
+    -- STACK; rows without one show nothing wherever they sit.
+    Place(CreateUnitButton("player", "[group:raid] hide; show"), 0, 0)
+    for i = 1, 4 do
+        local unit = "party" .. i
+        Place(CreateUnitButton(unit, "[group:raid] hide; [@" .. unit .. ",exists] show; hide"), 0, i)
     end
-    MarkLayout()
-end
-
--- The click area takes clicks only while there's a name to click. It can
--- only be switched out of combat, so it's switched on as combat starts.
-local function UpdateClicker()
-    if not clicker or InCombatLockdown() then return end
-    SetMouse(clicker, (not db.onlyAfflicted or #litOrder > 0) and true or false, false)
-end
-
--- Stacks the names from the top, straight under the title bar: the first
--- person to get a removable debuff gets the top row, the next one the row
--- below, and so on. Rows are plain frames, so this works in combat.
--- In "names always shown" mode everyone is listed in group order.
-Relayout = function()
-    layoutDirty = false
-    if #buttons == 0 then return end
-    local order, placed = {}, {}
-    if db.onlyAfflicted then
-        for _, b in ipairs(litOrder) do
-            if b:IsShown() then
-                order[#order + 1] = b
-                placed[b] = true
-            end
-        end
+    for i = 1, 40 do
+        local unit = "raid" .. i
+        local b = CreateUnitButton(unit, "[@" .. unit .. ",exists] show; hide")
+        Place(b, math.floor((i - 1) / RAID_ROWS), (i - 1) % RAID_ROWS)
     end
-    for _, b in ipairs(buttons) do
-        if b:IsShown() and not placed[b] then order[#order + 1] = b end
-    end
-    for i, b in ipairs(order) do
-        pcall(Place, b, math.floor((i - 1) / RAID_ROWS), (i - 1) % RAID_ROWS)
-    end
-    UpdateClicker()
+    frame:SetAttribute("pc-n", #buttons)
+    frame:SetAttribute("pc-per", RAID_ROWS)
+    frame:SetAttribute("pc-w", BTN_W)
+    frame:SetAttribute("pc-h", BTN_H)
+    frame:SetAttribute("pc-pad", PAD)
+    frame:SetAttribute("pc-top", HEADER_H)
 end
 
 local function ApplySpells()
     activeSpells = FindSpells()
     BuildCurves()
-    if not clicker then return end
-    for i, click in ipairs(CLICKS) do
-        local name = activeSpells[i]
-        clicker:SetAttribute(click.prefix .. "type" .. click.suffix, name and "macro" or nil)
-        clicker:SetAttribute(click.prefix .. "macrotext" .. click.suffix,
-            name and ("/cast [@mouseover,help,nodead] " .. name) or nil)
-    end
-    if #activeSpells == 0 then
-        clicker:SetAttribute("type1", "macro")
-        clicker:SetAttribute("macrotext1", "/target [@mouseover,help]")
+    for _, b in ipairs(buttons) do
+        local click = b.click
+        for i, c in ipairs(CLICKS) do
+            local name = activeSpells[i]
+            click:SetAttribute(c.prefix .. "type" .. c.suffix, name and "spell" or nil)
+            click:SetAttribute(c.prefix .. "spell" .. c.suffix, name)
+        end
+        if #activeSpells == 0 then
+            click:SetAttribute("type1", "target")
+        end
     end
 end
 
@@ -1111,7 +970,6 @@ local function SecureRefresh()
     ResizeWindow()
     frame:SetScale(db.scale or 1)
     ApplyVisibility()
-    MarkLayout() -- group or display mode changed: restack on the next frame
 end
 
 local function ApplySettings()
@@ -1384,6 +1242,62 @@ cog:SetScript("OnLeave", function() GameTooltip:Hide() end)
 ---------------------------------------------------------------------------
 -- Slash commands
 ---------------------------------------------------------------------------
+-- /pc why: run it while a name is lit (and, to check clicking, with the
+-- mouse resting on that name). Reports why stacking or clicking isn't working.
+local function MouseState(f)
+    local okC, c = pcall(f.IsMouseClickEnabled, f)
+    local okM, m = pcall(f.IsMouseMotionEnabled, f)
+    return "click " .. (okC and tostring(c) or "?") .. ", hover " .. (okM and tostring(m) or "?")
+end
+
+local function Why()
+    Print("--- why (in combat: " .. tostring(InCombatLockdown() and true or false) .. ") ---")
+    local attached, shownRows, lit = 0, 0, 0
+    local fTop = frame:GetTop()
+    for _, b in ipairs(buttons) do
+        if b.attached then attached = attached + 1 end
+        if b:IsVisible() then
+            shownRows = shownRows + 1
+            local okV, vis = pcall(b.click.IsVisible, b.click)
+            if okV and vis and b.attached then
+                lit = lit + 1
+                local row = "?"
+                local okT, bTop = pcall(b.GetTop, b)
+                if okT and bTop and fTop then
+                    row = tostring(math.floor((fTop - HEADER_H - PAD - bTop) / (BTN_H + PAD) + 0.5) + 1)
+                end
+                Print("  lit: " .. tostring(b.displayName or b.unit) .. " (" .. b.unit .. ") in row " .. row
+                    .. " | click button " .. MouseState(b.click))
+            end
+        end
+    end
+    Print("rows for your group: " .. shownRows .. " | lit: " .. lit
+        .. " | click buttons inside the debuff frame: " .. attached .. " of " .. #buttons)
+    if attached == 0 then
+        Print("  -> the game didn't allow putting click buttons inside its debuff frame;"
+            .. " every row stays clickable instead.")
+    end
+    local foci = {}
+    if GetMouseFoci then
+        local ok, list = pcall(function() return { GetMouseFoci() } end)
+        if ok and list then foci = list end
+    elseif GetMouseFocus then
+        foci = { GetMouseFocus() }
+    end
+    if #foci == 0 then
+        Print("frame under mouse: none")
+    else
+        for i = 1, math.min(#foci, 3) do
+            local f = foci[i]
+            local okN, n = pcall(f.GetName, f)
+            local parent = f.GetParent and f:GetParent()
+            local okP, pn = pcall(function() return parent and parent:GetName() end)
+            local name = (okN and n) or ("unnamed, parent " .. tostring(okP and pn or "?"))
+            Print("frame under mouse " .. i .. ": " .. tostring(name) .. " (" .. MouseState(f) .. ")")
+        end
+    end
+end
+
 local function Debug()
     local v1, v2, v3 = VersionInfo()
     Print(v1 .. " | " .. v2)
@@ -1470,6 +1384,8 @@ SlashCmdList.PHANTOMCURSE = function(msg)
     elseif msg == "version" then
         local v1, v2, v3 = VersionInfo()
         Print(v1 .. " | " .. v2 .. " | " .. v3)
+    elseif msg == "why" then
+        Why()
     elseif msg == "debug" then
         Debug()
     elseif msg == "spells" then
@@ -1481,7 +1397,7 @@ SlashCmdList.PHANTOMCURSE = function(msg)
             end
         end
     else
-        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | test | spells | version | debug")
+        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | test | spells | version | debug | why")
     end
 end
 
@@ -1520,7 +1436,6 @@ events:SetScript("OnEvent", function(_, event, arg1)
         filterOK = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
         spellsDirty = true
         CreateButtons()
-        UpdateRowVisibility()
         ApplySettings()
 
         -- Safety net in case an aura change arrives without an event. Only
@@ -1533,26 +1448,19 @@ events:SetScript("OnEvent", function(_, event, arg1)
         SafeRegister("GROUP_ROSTER_UPDATE")
         SafeRegister("PLAYER_ENTERING_WORLD")
         SafeRegister("PLAYER_REGEN_ENABLED")
-        SafeRegister("PLAYER_REGEN_DISABLED")
         SafeRegister("SPELLS_CHANGED")
         SafeRegister("PLAYER_TALENT_UPDATE")
         SafeRegister("PLAYER_SPECIALIZATION_CHANGED")
         SafeRegister("UNIT_PET")
 
-    elseif event == "PLAYER_REGEN_DISABLED" then
-        -- Last moment before the combat lock: switch the click area on so a
-        -- name that lights up mid-fight can be clicked. With no name under
-        -- the mouse, a click still casts nothing.
-        if clicker then SetMouse(clicker, true, false) end
-
     elseif event == "PLAYER_REGEN_ENABLED" then
-        if pending then SecureRefresh() end
-        UpdateClicker()
+        -- Always: a debuff frame first set up during combat only gets its
+        -- click button once combat ends.
+        SecureRefresh()
         MarkAllDirty()
 
     elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
         if event == "PLAYER_ENTERING_WORLD" then spellsDirty = true end
-        UpdateRowVisibility()
         RefreshContainers()
         SecureRefresh()
         MarkAllDirty()
