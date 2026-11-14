@@ -613,7 +613,8 @@ local STACK = [[
     for i = 1, n do
         local row = header:GetFrameRef("pc-row" .. i)
         local click = header:GetFrameRef("pc-click" .. i)
-        if row and click and click:IsVisible() then
+        local slot = header:GetFrameRef("pc-slot" .. i)
+        if row and click and ((slot and slot:IsVisible()) or (not slot and click:IsVisible())) then
             row:ClearAllPoints()
             row:SetPoint("TOPLEFT", header, "TOPLEFT",
                 pad + col * (w + pad), -(top + pad + r * (h + pad)))
@@ -656,6 +657,7 @@ local function AttachContainer(b)
 
         local function init(btn)
             b.auraButton = b.auraButton or btn
+            b.slotFrame = btn
             btn:ClearAllPoints()
             btn:SetAllPoints(c)
             -- The debuff frame itself never takes the mouse; the click button
@@ -663,6 +665,22 @@ local function AttachContainer(b)
             pcall(btn.SetMouseClickEnabled, btn, false)
             pcall(btn.SetMouseMotionEnabled, btn, false)
             pcall(btn.EnableMouse, btn, false)
+
+            -- The game's aura slot owns the visibility signal for an
+            -- afflicted row. Nudge the secure click button when that slot
+            -- changes so secure compaction runs for arrivals and removals.
+            btn:HookScript("OnShow", function()
+                if b.click and b.click:IsShown() then
+                    b.click:Hide()
+                    b.click:Show()
+                end
+            end)
+            btn:HookScript("OnHide", function()
+                if b.click and b.click:IsShown() then
+                    b.click:Hide()
+                    b.click:Show()
+                end
+            end)
 
             -- Fill, tinted by the game in the debuff type's colour.
             local fill = btn:CreateTexture(nil, "BACKGROUND")
@@ -705,6 +723,7 @@ local function AttachContainer(b)
             initializeFrame = init,
         })
         if type(ab) == "table" and not b.auraButton then b.auraButton = ab end
+        b.slotFrame = b.slotFrame or b.auraButton
 
         pcall(c.UpdateAllAuras, c)
 
@@ -874,6 +893,7 @@ local function CreateUnitButton(unit, visibility)
     local i = #buttons
     frame:SetFrameRef("pc-row" .. i, b)
     frame:SetFrameRef("pc-click" .. i, click)
+    if b.slotFrame then frame:SetFrameRef("pc-slot" .. i, b.slotFrame) end
     click:SetFrameRef("pc-header", frame)
     SecureHandlerWrapScript(click, "OnShow", frame, STACK)
     SecureHandlerWrapScript(click, "OnHide", frame, STACK)
