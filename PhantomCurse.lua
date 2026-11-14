@@ -478,18 +478,6 @@ local function UpdateButton(b)
     b.displayName = text
     b.name:SetFormattedText("%s", text)
 
-    -- Text updates may be allowed even while the aura frame's layout is
-    -- locked. Try in combat too, so members joining then don't stay unnamed.
-    -- Cache only successful writes; rejected writes must be retried.
-    -- Secret names cannot be compared in Lua. Always refresh the aura-slot
-    -- label for secret values; cache only ordinary names to avoid needless writes.
-    if b.slotName and (issecret(text) or b.slotText ~= text) then
-        local ok, err = pcall(SetUnitNameText, b.slotName, unit)
-        if ok and not issecret(text) then b.slotText = text
-        elseif issecret(text) then b.slotText = nil end
-        b.slotNameError = not ok and tostring(err) or nil
-    end
-
     -- Rows with the game-drawn highlight don't need the addon's own scan.
     local aura = not b.container and FindDispellable(unit)
     local testing = b.testUntil and GetTime() < b.testUntil
@@ -525,7 +513,17 @@ local function UpdateButton(b)
     -- Display mode: in "only when removable" the row is blank unless afflicted.
     local showRow = detected or not db.onlyAfflicted
     b.bg:SetShown(showRow and true or false)
-    b.name:SetShown(showRow and true or false)
+    if b.container and db.onlyAfflicted then
+        -- The aura slot's visibility is controlled by Blizzard and remains
+        -- readable to secure OnShow/OnHide handlers during combat. Let those
+        -- handlers show the row's name without inspecting aura data here.
+        if not InCombatLockdown() then
+            local slotShown = b.auraButton and b.auraButton:IsShown()
+            b.name:SetShown(slotShown and true or false)
+        end
+    else
+        b.name:SetShown(showRow and true or false)
+    end
 
     if (detected or layered) and db.pulse then
         if not b.pulse:IsPlaying() then b.pulse:Play() end
@@ -687,12 +685,16 @@ local function AttachContainer(b)
             -- afflicted row. Nudge the secure click button when that slot
             -- changes so secure compaction runs for arrivals and removals.
             btn:HookScript("OnShow", function()
+                SetUnitNameText(b.name, b.unit)
+                b.name:SetTextColor(1, 1, 1)
+                b.name:Show()
                 if b.click and b.click:IsShown() then
                     b.click:Hide()
                     b.click:Show()
                 end
             end)
             btn:HookScript("OnHide", function()
+                if db.onlyAfflicted then b.name:Hide() end
                 if b.click and b.click:IsShown() then
                     b.click:Hide()
                     b.click:Show()
@@ -714,14 +716,6 @@ local function AttachContainer(b)
                 elseif i == 3 then e:SetPoint("TOPLEFT"); e:SetPoint("BOTTOMLEFT"); e:SetWidth(1)
                 else e:SetPoint("TOPRIGHT"); e:SetPoint("BOTTOMRIGHT"); e:SetWidth(1) end
             end
-
-            local fs = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-            fs:SetPoint("LEFT", 4, 0)
-            fs:SetPoint("RIGHT", -4, 0)
-            fs:SetJustifyH("LEFT")
-            fs:SetWordWrap(false)
-            SetUnitNameText(fs, b.unit)
-            b.slotName = fs
 
             local ag = fill:CreateAnimationGroup()
             local fade = ag:CreateAnimation("Alpha")
@@ -854,7 +848,9 @@ local function CreateUnitButton(unit, visibility)
     -- Text and outline sit above the fill.
     local top = CreateFrame("Frame", nil, b)
     top:SetAllPoints()
-    top:SetFrameLevel(b:GetFrameLevel() + 2)
+    -- Keep the row label above the game-managed AuraContainer slot so the
+    -- name remains readable over its dispel highlight.
+    top:SetFrameLevel(b:GetFrameLevel() + 20)
 
     b.layerNames = {}
     for i = 1, N_LAYERS do
@@ -1347,9 +1343,12 @@ local function Debug()
             local ok, visible = pcall(function()
                 return tostring(b.auraButton and b.auraButton:IsVisible() or false)
             end)
+            local okName, nameShown = pcall(b.name.IsShown, b.name)
+            local nameKind = issecret(b.displayName) and "protected text passed to FontString"
+                or "ordinary text passed to FontString"
             Print("  " .. b.unit .. " | aura frame: " .. (ok and visible or "restricted")
-                .. " | name: " .. tostring(b.slotText or "not updated")
-                .. (b.slotNameError and (" | name update failed: " .. b.slotNameError) or ""))
+                .. " | row name shown: " .. (okName and tostring(nameShown) or "restricted")
+                .. " | " .. nameKind)
         end
     end
     for i, name in ipairs(activeSpells) do
