@@ -109,6 +109,8 @@ local DEFAULTS = {
     attachClicks = true,       -- click buttons inside the game's debuff frame (stacking + click-through)
     scale = 1,
     alpha = 0.85,
+    showMinimap = true,
+    minimapAngle = 200,
 }
 
 local db = {}
@@ -1382,6 +1384,61 @@ local function SetHidden(hidden)
     end
 end
 
+local minimapButton
+local function PositionMinimapButton()
+    if not minimapButton or not Minimap then return end
+    local angle = math.rad(db.minimapAngle or 200)
+    local radius = Minimap:GetWidth() / 2 + 8
+    minimapButton:ClearAllPoints()
+    minimapButton:SetPoint("CENTER", Minimap, "CENTER", math.cos(angle) * radius, math.sin(angle) * radius)
+end
+
+local function CreateMinimapButton()
+    if not Minimap or minimapButton then return end
+    local button = CreateFrame("Button", "PhantomCurseMinimapButton", Minimap)
+    minimapButton = button
+    button:SetSize(31, 31)
+    button:SetFrameStrata("MEDIUM")
+    button:SetFrameLevel(Minimap:GetFrameLevel() + 8)
+    button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    button:RegisterForDrag("LeftButton")
+    button:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
+    local icon = button:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(22, 22)
+    icon:SetPoint("CENTER", 0, 1)
+    icon:SetTexture("Interface\\Icons\\Spell_Holy_DispelMagic")
+    local border = button:CreateTexture(nil, "OVERLAY")
+    border:SetSize(54, 54)
+    border:SetPoint("TOPLEFT")
+    border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+    button:SetScript("OnDragStart", function(self)
+        self:SetScript("OnUpdate", function()
+            local x, y = GetCursorPosition()
+            local scale = Minimap:GetEffectiveScale()
+            local cx, cy = Minimap:GetCenter()
+            db.minimapAngle = math.deg(math.atan2(y / scale - cy, x / scale - cx))
+            PositionMinimapButton()
+        end)
+    end)
+    button:SetScript("OnDragStop", function(self) self:SetScript("OnUpdate", nil) end)
+    button:SetScript("OnClick", function(_, mouse)
+        if mouse == "RightButton" then ToggleSettings()
+        else SetHidden(not db.hidden) end
+    end)
+    button:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+        GameTooltip:AddLine("PhantomCurse")
+        GameTooltip:AddLine("Left-click: show or hide the cleanse window", 1, 1, 1)
+        GameTooltip:AddLine("Right-click: settings", 1, 1, 1)
+        GameTooltip:AddLine("Drag: move around the minimap", .7, .7, .7)
+        GameTooltip:Show()
+    end)
+    button:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    PositionMinimapButton()
+    button:SetShown(db.showMinimap ~= false)
+    Minimap:HookScript("OnSizeChanged", PositionMinimapButton)
+end
+
 SLASH_PHANTOMCURSE1 = "/phantomcurse"
 SLASH_PHANTOMCURSE2 = "/pc"
 SlashCmdList.PHANTOMCURSE = function(msg)
@@ -1406,6 +1463,10 @@ SlashCmdList.PHANTOMCURSE = function(msg)
         Print("hide out of combat " .. (db.autoHide and "on." or "off."))
     elseif msg == "reset" then
         ResetPosition()
+    elseif msg == "minimap" then
+        db.showMinimap = not db.showMinimap
+        if minimapButton then minimapButton:SetShown(db.showMinimap) end
+        Print("minimap icon " .. (db.showMinimap and "shown." or "hidden."))
     elseif msg == "test" then
         TestHighlight()
     elseif msg == "mode" then
@@ -1438,7 +1499,7 @@ SlashCmdList.PHANTOMCURSE = function(msg)
             end
         end
     else
-        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | test | spells | version | debug | why | attach")
+        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | minimap | test | spells | version | debug | why | attach")
     end
 end
 
@@ -1477,6 +1538,7 @@ events:SetScript("OnEvent", function(_, event, arg1)
         filterOK = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
         spellsDirty = true
         CreateButtons()
+        CreateMinimapButton()
         ApplySettings()
 
         -- Safety net in case an aura change arrives without an event. Only

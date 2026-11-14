@@ -3,6 +3,7 @@
 ## Notes: Click a name to cleanse it. A small decurse window for healers.
 ## Author: You
 ## Version: 1.0.0
+## IconTexture: Interface\Icons\Spell_Holy_DispelMagic
 ## SavedVariables: PhantomCurseDB
 
 PhantomCurse.lua
