@@ -24,6 +24,8 @@ Restart the game or use `/reload`, then enable PhantomCurse in the AddOns list.
   they have a debuff the game identifies as removable by your character.
   Active rows compact from the top of the window as debuffs appear and clear.
 - Switch to **Names always shown** from `/pc mode` or the settings window.
+- Shows a brief on-screen popup when the game-managed dispel slot appears. The
+  popup can be disabled in settings; the alert sound has its own setting.
 - Drag the title bar to move the window. Use `/pc lock` to toggle position
   locking.
 

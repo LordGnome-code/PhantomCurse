@@ -111,6 +111,7 @@ local CLICKS = {
 local DEFAULTS = {
     locked = false,
     sound = true,
+    popup = true,
     autoHide = false,
     hideSolo = false,
     classColors = true,
@@ -459,6 +460,44 @@ local function PlayAlert()
     PlaySound(SOUNDKIT and SOUNDKIT.RAID_WARNING or 8959, "Master")
 end
 
+-- A brief visual alert, separate from the cleanse window. It is created at
+-- load time so showing it in combat only updates an ordinary display frame.
+local popupFrame = CreateFrame("Frame", "PhantomCurseAlert", UIParent, "BackdropTemplate")
+popupFrame:SetSize(340, 54)
+popupFrame:SetPoint("TOP", UIParent, "TOP", 0, -110)
+popupFrame:SetFrameStrata("DIALOG")
+popupFrame:SetFrameLevel(100)
+popupFrame:SetClampedToScreen(true)
+popupFrame:SetBackdrop({
+    bgFile = "Interface\\Buttons\\WHITE8X8",
+    edgeFile = "Interface\\Buttons\\WHITE8X8",
+    edgeSize = 2,
+})
+popupFrame:SetBackdropColor(0.12, 0.04, 0.08, 0.95)
+popupFrame:SetBackdropBorderColor(1, 0.25, 0.2, 1)
+local popupTitle = popupFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+popupTitle:SetPoint("TOP", popupFrame, "TOP", 0, -6)
+popupTitle:SetText("DISPELLABLE DEBUFF")
+popupTitle:SetTextColor(1, 0.35, 0.25)
+local popupName = popupFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+popupName:SetPoint("BOTTOM", popupFrame, "BOTTOM", 0, 7)
+popupName:SetWidth(320)
+popupName:SetWordWrap(false)
+popupName:SetJustifyH("CENTER")
+popupFrame:Hide()
+local popupSerial = 0
+
+local function ShowDispelPopup(unit)
+    if not db.popup then return end
+    SetUnitNameText(popupName, unit)
+    popupSerial = popupSerial + 1
+    local serial = popupSerial
+    popupFrame:Show()
+    C_Timer.After(4, function()
+        if popupSerial == serial then popupFrame:Hide() end
+    end)
+end
+
 -- Draws the parts of a row the addon itself controls: the name in "names
 -- always shown" mode, the test highlight, and the fallback highlight on
 -- clients without the game-drawn one. The game-drawn highlight needs none of
@@ -486,7 +525,10 @@ local function UpdateButton(b)
 
     -- Fallback rows only; game-drawn rows play the sound from their click button.
     if not b.container then
-        if aura and not b.afflicted then PlayAlert() end
+        if aura and not b.afflicted then
+            ShowDispelPopup(unit)
+            PlayAlert()
+        end
         b.afflicted = aura and true or false
     end
 
@@ -688,6 +730,8 @@ local function AttachContainer(b)
                 SetUnitNameText(b.name, b.unit)
                 b.name:SetTextColor(1, 1, 1)
                 b.name:Show()
+                ShowDispelPopup(b.unit)
+                PlayAlert()
                 if b.click and b.click:IsShown() then
                     b.click:Hide()
                     b.click:Show()
@@ -911,9 +955,13 @@ local function CreateUnitButton(unit, visibility)
     SecureHandlerWrapScript(click, "OnShow", frame, STACK)
     SecureHandlerWrapScript(click, "OnHide", frame, STACK)
 
-    -- Alert sound when a name appears (game-drawn highlight only).
+    -- Alert when the game-managed dispel slot appears; this is the combat-safe
+    -- signal and requires no addon-side aura inspection.
     click:HookScript("OnShow", function()
-        if b.attached then PlayAlert() end
+        if b.attached and not b.auraButton then
+            ShowDispelPopup(b.unit)
+            PlayAlert()
+        end
     end)
     return b
 end
@@ -1121,6 +1169,7 @@ local function BuildSettings()
     Check("Hide when out of combat", "autoHide")
     Check("Hide when not in a group", "hideSolo")
     Check("Alert sound", "sound")
+    Check("Popup on dispellable debuff", "popup")
     Check("Pulse the highlight", "pulse")
     Check("Class-coloured names", "classColors")
     Check("Highlight all debuff types", "allTypes")
