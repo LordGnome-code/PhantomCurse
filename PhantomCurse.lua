@@ -29,6 +29,18 @@ local filterOK = true
 
 local issecret = issecretvalue or function() return false end
 
+-- Unit names can be secret during combat. Keep them opaque and send them
+-- straight to a display sink; never format, compare, or otherwise inspect one.
+local function UnitNameForDisplay(unit)
+    local name = GetUnitName(unit, false)
+    if issecret(name) then return name end
+    return name or unit
+end
+
+local function SetUnitNameText(fontString, unit)
+    fontString:SetFormattedText("%s", UnitNameForDisplay(unit))
+end
+
 local TYPE_COLORS = {
     Magic   = { 0.20, 0.60, 1.00 },
     Curse   = { 0.60, 0.00, 1.00 },
@@ -462,16 +474,19 @@ local function UpdateButton(b)
         return
     end
 
-    local text = GetUnitName(unit, false) or unit
+    local text = UnitNameForDisplay(unit)
     b.displayName = text
-    b.name:SetText(text)
+    b.name:SetFormattedText("%s", text)
 
     -- Text updates may be allowed even while the aura frame's layout is
     -- locked. Try in combat too, so members joining then don't stay unnamed.
     -- Cache only successful writes; rejected writes must be retried.
-    if b.slotName and b.slotText ~= text then
-        local ok, err = pcall(b.slotName.SetText, b.slotName, text)
-        if ok then b.slotText = text end
+    -- Secret names cannot be compared in Lua. Always refresh the aura-slot
+    -- label for secret values; cache only ordinary names to avoid needless writes.
+    if b.slotName and (issecret(text) or b.slotText ~= text) then
+        local ok, err = pcall(SetUnitNameText, b.slotName, unit)
+        if ok and not issecret(text) then b.slotText = text
+        elseif issecret(text) then b.slotText = nil end
         b.slotNameError = not ok and tostring(err) or nil
     end
 
@@ -705,7 +720,7 @@ local function AttachContainer(b)
             fs:SetPoint("RIGHT", -4, 0)
             fs:SetJustifyH("LEFT")
             fs:SetWordWrap(false)
-            fs:SetText(b.displayName or GetUnitName(b.unit, false) or "")
+            SetUnitNameText(fs, b.unit)
             b.slotName = fs
 
             local ag = fill:CreateAnimationGroup()
@@ -1290,7 +1305,8 @@ local function Why()
                 if okT and bTop and fTop then
                     row = tostring(math.floor((fTop - HEADER_H - PAD - bTop) / (BTN_H + PAD) + 0.5) + 1)
                 end
-                Print("  lit: " .. tostring(b.displayName or b.unit) .. " (" .. b.unit .. ") in row " .. row
+                local display = issecret(b.displayName) and "(protected name displayed by client)" or tostring(b.displayName or b.unit)
+                Print("  lit: " .. display .. " (" .. b.unit .. ") in row " .. row
                     .. " | click button " .. MouseState(b.click))
             end
         end
