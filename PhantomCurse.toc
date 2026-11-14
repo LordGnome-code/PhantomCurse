@@ -4,6 +4,7 @@
 ## Author: You
 ## Version: 1.0.0
 ## IconTexture: Interface\Icons\Spell_Holy_DispelMagic
+## AddonCompartmentFunc: PhantomCurse_OnAddonCompartmentClick
 ## SavedVariables: PhantomCurseDB
 
 PhantomCurse.lua

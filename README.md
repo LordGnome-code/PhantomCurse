@@ -14,6 +14,8 @@ Restart the game or use `/reload`, then enable PhantomCurse in the AddOns list.
 - Type `/pc` or `/phantomcurse` to see the available commands. The minimap
   dispel icon opens or hides the cleanse window with a left-click and opens
   settings with a right-click. Drag it around the minimap to reposition it.
+  The addon also registers this icon in the native Addon Compartment for
+  minimap icon-bag addons.
 - Use `/pc minimap` to show or hide the minimap icon.
 - Click a highlighted group member to cast a dispel on them.
 - Left, right, and middle clicks plus Shift + left click can each use a

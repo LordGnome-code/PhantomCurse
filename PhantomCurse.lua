@@ -1441,6 +1441,14 @@ end
 
 SLASH_PHANTOMCURSE1 = "/phantomcurse"
 SLASH_PHANTOMCURSE2 = "/pc"
+function PhantomCurse_OnAddonCompartmentClick(_, buttonName)
+    if buttonName == "RightButton" then
+        ToggleSettings()
+    else
+        SetHidden(not db.hidden)
+    end
+end
+
 SlashCmdList.PHANTOMCURSE = function(msg)
     msg = (msg or ""):lower():match("^%s*(.-)%s*$")
     if msg == "config" or msg == "options" or msg == "settings" then
