@@ -145,6 +145,7 @@ local maskCurve                -- same, but invisible for types you can't remove
 local settings                 -- options window, built on first use
 local useContainers = true     -- game-drawn highlight available?
 local containerError           -- why not, if it isn't
+local reportedContainerError = false
 
 local function Print(msg)
     print("|cff9d7dffPhantomCurse|r: " .. msg)
@@ -207,7 +208,7 @@ local function KnownByName(name, id)
     if id > 0 and spellID and spellID ~= id and SpellName(id) then
         return false
     end
-    return true
+    return spellID and IsKnown(spellID) or false
 end
 
 local function FindSpells()
@@ -518,9 +519,14 @@ local function UpdateButton(b)
     local text = UnitNameForDisplay(unit)
     b.displayName = text
     b.name:SetFormattedText("%s", text)
+    b.name:Show()
 
     -- Rows with the game-drawn highlight don't need the addon's own scan.
-    local aura = not b.container and FindDispellable(unit)
+    local aura
+    if not b.container then
+        local ok, found = pcall(FindDispellable, unit)
+        if ok then aura = found end
+    end
     local testing = b.testUntil and GetTime() < b.testUntil
     local detected = testing or (not b.container and aura)
     local layered = false
@@ -555,7 +561,7 @@ local function UpdateButton(b)
     end
 
     -- Display mode: in "only when removable" the row is blank unless afflicted.
-    local showRow = detected or not db.onlyAfflicted or b.container
+    local showRow = true
     b.bg:SetShown(showRow and true or false)
     if b.container and db.onlyAfflicted and b.attached then
         if b.attached then
@@ -721,7 +727,9 @@ local function AttachContainer(b)
             b.auraButton = b.auraButton or btn
             b.slotFrame = btn
             btn:ClearAllPoints()
-            btn:SetAllPoints(c)
+            btn:SetPoint("CENTER", b, "CENTER", 0, 0)
+            btn:SetSize(BTN_W, BTN_H)
+            btn:SetFrameLevel(b:GetFrameLevel() + 4)
             -- The debuff frame itself never takes the mouse; the click button
             -- inside it does.
             pcall(btn.SetMouseClickEnabled, btn, false)
@@ -729,7 +737,7 @@ local function AttachContainer(b)
             pcall(btn.EnableMouse, btn, false)
 
             -- Fill, tinted by the game in the debuff type's colour.
-            local fill = btn:CreateTexture(nil, "BACKGROUND")
+            local fill = btn:CreateTexture(nil, "OVERLAY")
             fill:SetAllPoints()
             fill:SetTexture("Interface\\Buttons\\WHITE8x8")
             fill:SetVertexColor(1, 0.1, 0.1)
@@ -737,6 +745,18 @@ local function AttachContainer(b)
             btn:AddDispelTypeTexture(fill, { style = preserve,
                 showWhenHarmful = true, showWhenHelpful = false,
                 showWithoutDispelType = false })
+
+            if styles and styles.Icon then
+                local indicator = btn:CreateTexture(nil, "OVERLAY", nil, 1)
+                indicator:SetPoint("RIGHT", btn, "RIGHT", -2, 0)
+                indicator:SetSize(BTN_H - 2, BTN_H - 2)
+                btn:AddDispelTypeTexture(indicator, {
+                    style = styles.Icon,
+                    showWhenHarmful = true,
+                    showWhenHelpful = false,
+                    showWithoutDispelType = false,
+                })
+            end
 
             for i = 1, 4 do
                 local e = btn:CreateTexture(nil, "BORDER")
@@ -777,8 +797,12 @@ local function AttachContainer(b)
     end)
     if not ok then
         b.container = nil
-        useContainers = false
         containerError = tostring(err)
+        if not reportedContainerError then
+            reportedContainerError = true
+            Print("Dispel indicator setup failed for " .. b.unit .. ": " .. containerError)
+            Print("Named cleanse buttons remain available. Indicator initialization did not complete.")
+        end
     end
 end
 
@@ -935,7 +959,8 @@ local function CreateUnitButton(unit, visibility)
     pcall(click.SetMouseMotionEnabled, click, false) -- no hover effects
     b.click = click
 
-    if useContainers then AttachContainer(b) end
+    SetUnitNameText(b.name, unit)
+    AttachContainer(b)
 
     b:SetScript("OnShow", UpdateButton)
     RegisterStateDriver(b, "visibility", visibility)
