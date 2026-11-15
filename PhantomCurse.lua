@@ -556,12 +556,16 @@ local function UpdateButton(b)
     local showRow = detected or not db.onlyAfflicted
     b.bg:SetShown(showRow and true or false)
     if b.container and db.onlyAfflicted then
+        if b.attached then
+            b.name:Show()
+        else
         -- The aura slot's visibility is controlled by Blizzard and remains
         -- readable to secure OnShow/OnHide handlers during combat. Let those
         -- handlers show the row's name without inspecting aura data here.
         if not InCombatLockdown() then
             local slotShown = b.auraButton and b.auraButton:IsShown()
             b.name:SetShown(slotShown and true or false)
+        end
         end
     else
         b.name:SetShown(showRow and true or false)
@@ -732,17 +736,9 @@ local function AttachContainer(b)
                 b.name:Show()
                 ShowDispelPopup(b.unit)
                 PlayAlert()
-                if b.click and b.click:IsShown() then
-                    b.click:Hide()
-                    b.click:Show()
-                end
             end)
             btn:HookScript("OnHide", function()
-                if db.onlyAfflicted then b.name:Hide() end
-                if b.click and b.click:IsShown() then
-                    b.click:Hide()
-                    b.click:Show()
-                end
+                if db.onlyAfflicted and not b.attached then b.name:Hide() end
             end)
 
             -- Fill, tinted by the game in the debuff type's colour.
@@ -773,8 +769,8 @@ local function AttachContainer(b)
             b.slotPulse = { btn = btn, ag = ag, on = db.pulse }
         end
 
-        local ab = c:AddAuraSlot("dispel", "HARMFUL", {
-            candidateFilters = { includeDispelTypes = set },
+        local ab = c:AddAuraSlot("dispel", db.allTypes and "HARMFUL" or FILTER, {
+            candidateFilters = db.allTypes and { includeDispelTypes = set } or nil,
             initializeFrame = init,
         })
         if type(ab) == "table" and not b.auraButton then b.auraButton = ab end
@@ -806,6 +802,13 @@ local function AttachClick(b)
     end
     b.clickParent = want
     b.attached = want ~= b
+    -- Configure the label before combat. Parent visibility then controls it
+    -- together with the secure cast button, without combat-time mutations.
+    b.name:SetParent(b.click)
+    b.name:ClearAllPoints()
+    b.name:SetPoint("LEFT", b.click, "LEFT", 4, 0)
+    b.name:SetPoint("RIGHT", b.click, "RIGHT", -4, 0)
+    b.name:Show()
     b.click:ClearAllPoints()
     b.click:SetAllPoints(b)
     local okL, lvl = pcall(want.GetFrameLevel, want)
@@ -819,8 +822,10 @@ local function UpdateContainers()
     for _, b in ipairs(buttons) do
         if b.container then
             if b.filterKey ~= key then
-                local ok = pcall(b.container.SetAuraSlotCandidateFilters, b.container,
-                    "dispel", { includeDispelTypes = set })
+                local ok = pcall(function()
+                    b.container:SetAuraSlotFilterString("dispel", db.allTypes and "HARMFUL" or FILTER)
+                    b.container:SetAuraSlotCandidateFilters("dispel", db.allTypes and { includeDispelTypes = set } or {})
+                end)
                 if ok then b.filterKey = key end
             end
             local pulse = b.slotPulse
@@ -1387,6 +1392,8 @@ local function Debug()
     local v1, v2, v3 = VersionInfo()
     Print(v1 .. " | " .. v2)
     Print(v3 .. (containerError and (" - " .. containerError) or ""))
+    Print("popup alert: " .. (db.popup and "enabled" or "disabled")
+        .. " | alert sound: " .. (db.sound and "enabled" or "disabled"))
     for _, b in ipairs(buttons) do
         if b:IsVisible() and UnitExists(b.unit) then
             local ok, visible = pcall(function()
