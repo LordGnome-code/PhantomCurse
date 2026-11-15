@@ -726,6 +726,23 @@ local function AttachContainer(b)
             pcall(btn.SetMouseMotionEnabled, btn, false)
             pcall(btn.EnableMouse, btn, false)
 
+            -- Attach during initialization, while the native slot is still
+            -- accessible. Later reparenting can be refused by aura lockdown.
+            if db.attachClicks and db.onlyAfflicted then
+                b.click:SetParent(btn)
+                b.click:ClearAllPoints()
+                b.click:SetAllPoints(b)
+                b.click:SetFrameLevel(btn:GetFrameLevel() + 10)
+                b.clickParent = btn
+                b.attached = true
+                b.name:SetParent(b.click)
+                b.name:ClearAllPoints()
+                b.name:SetPoint("LEFT", b.click, "LEFT", 4, 0)
+                b.name:SetPoint("RIGHT", b.click, "RIGHT", -4, 0)
+                SetUnitNameText(b.name, b.unit)
+                b.name:Show()
+            end
+
             -- Fill, tinted by the game in the debuff type's colour.
             local fill = btn:CreateTexture(nil, "BACKGROUND")
             fill:SetAllPoints()
@@ -1604,6 +1621,10 @@ events:SetScript("OnEvent", function(_, event, arg1)
         -- Skip the client-side filter if this client rejects it.
         filterOK = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
         spellsDirty = true
+        -- Build native slot filters from the actual spellbook, rather than
+        -- creating slots first with the fallback class capabilities.
+        activeSpells = FindSpells()
+        BuildCurves()
         CreateButtons()
         CreateMinimapButton()
         ApplySettings()
