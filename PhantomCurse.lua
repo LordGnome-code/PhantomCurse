@@ -112,6 +112,7 @@ local DEFAULTS = {
     locked = false,
     sound = true,
     popup = true,
+    wowLayout = false,
     autoHide = false,
     hideSolo = false,
     classColors = true,
@@ -553,9 +554,9 @@ local function UpdateButton(b)
     end
 
     -- Display mode: in "only when removable" the row is blank unless afflicted.
-    local showRow = detected or not db.onlyAfflicted
+    local showRow = detected or not db.onlyAfflicted or b.container
     b.bg:SetShown(showRow and true or false)
-    if b.container and db.onlyAfflicted then
+    if b.container and db.onlyAfflicted and b.attached then
         if b.attached then
             b.name:Show()
         else
@@ -726,29 +727,15 @@ local function AttachContainer(b)
             pcall(btn.SetMouseMotionEnabled, btn, false)
             pcall(btn.EnableMouse, btn, false)
 
-            -- Attach during initialization, while the native slot is still
-            -- accessible. Later reparenting can be refused by aura lockdown.
-            if db.attachClicks and db.onlyAfflicted then
-                b.click:SetParent(btn)
-                b.click:ClearAllPoints()
-                b.click:SetAllPoints(b)
-                b.click:SetFrameLevel(btn:GetFrameLevel() + 10)
-                b.clickParent = btn
-                b.attached = true
-                b.name:SetParent(b.click)
-                b.name:ClearAllPoints()
-                b.name:SetPoint("LEFT", b.click, "LEFT", 4, 0)
-                b.name:SetPoint("RIGHT", b.click, "RIGHT", -4, 0)
-                SetUnitNameText(b.name, b.unit)
-                b.name:Show()
-            end
-
             -- Fill, tinted by the game in the debuff type's colour.
             local fill = btn:CreateTexture(nil, "BACKGROUND")
             fill:SetAllPoints()
             fill:SetTexture("Interface\\Buttons\\WHITE8x8")
             fill:SetVertexColor(1, 0.1, 0.1)
-            pcall(btn.AddDispelTypeTexture, btn, fill, { style = preserve })
+            btn:ClearDispelTypeTextures()
+            btn:AddDispelTypeTexture(fill, { style = preserve,
+                showWhenHarmful = true, showWhenHelpful = false,
+                showWithoutDispelType = false })
 
             for i = 1, 4 do
                 local e = btn:CreateTexture(nil, "BORDER")
@@ -800,7 +787,7 @@ end
 -- be re-parented in combat.
 local function AttachClick(b)
     if InCombatLockdown() then return end
-    local want = (db.attachClicks and db.onlyAfflicted and b.auraButton) or b
+    local want = b
     if b.clickParent == want then return end
     if not pcall(b.click.SetParent, b.click, want) then
         want = b
@@ -1073,6 +1060,27 @@ local function ApplySettings()
     frame:SetBackdropColor(0.05, 0.03, 0.08, compact and 0 or (db.alpha or 0.85))
     frame:SetBackdropBorderColor(0.45, 0.30, 0.75, compact and 0 or 1)
     header.bg:SetShown(compact and true or false)
+    local backdrop = db.wowLayout and {
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true, tileSize = 32, edgeSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 },
+    } or {
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 1,
+    }
+    frame:SetBackdrop(backdrop)
+    if db.wowLayout then
+        frame:SetBackdropColor(1, 1, 1, db.alpha or 0.85)
+        frame:SetBackdropBorderColor(1, 1, 1, 1)
+    end
+    if settings then
+        settings:SetBackdrop(backdrop)
+        settings:SetBackdropColor(db.wowLayout and 1 or 0.05, db.wowLayout and 1 or 0.03,
+            db.wowLayout and 1 or 0.08, 0.95)
+        settings:SetBackdropBorderColor(db.wowLayout and 1 or 0.45,
+            db.wowLayout and 1 or 0.30, db.wowLayout and 1 or 0.75, 1)
+    end
     SecureRefresh()
     MarkAllDirty()
 end
@@ -1117,7 +1125,7 @@ end
 
 local function BuildSettings()
     local f = CreateFrame("Frame", "PhantomCurseSettings", UIParent, "BackdropTemplate")
-    f:SetSize(250, 490)
+    f:SetSize(250, 550)
     f:SetPoint("CENTER")
     f:SetFrameStrata("DIALOG")
     f:SetClampedToScreen(true)
@@ -1175,6 +1183,7 @@ local function BuildSettings()
     end
 
     Check("Show window", "hidden", true)
+    Check("WoW window appearance", "wowLayout")
     Check("Lock position", "locked")
     Check("Hide when out of combat", "autoHide")
     Check("Hide when not in a group", "hideSolo")
