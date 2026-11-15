@@ -1488,11 +1488,23 @@ local function Debug()
     for _, t in ipairs(TYPE_ORDER) do
         if Removable(t) then shown[#shown + 1] = t end
     end
+    Print("highlighting types: " .. (#shown > 0 and table.concat(shown, ", ") or "none"))
+    local unitChecks = 0
+    for _, b in ipairs(buttons) do
+        if b:IsVisible() and UnitExists(b.unit) then
+            unitChecks = unitChecks + 1
+            local okF, hit = pcall(function()
+                return C_UnitAuras.GetAuraDataByIndex(b.unit, 1, FILTER) ~= nil
+            end)
+            local result = not okF and "query blocked/error"
+                or (hit and "FILTER MATCH" or "no filter match")
+            Print("  " .. b.unit .. " dispellable filter: " .. result
+                .. (b.unit == "player" and " (self)" or ""))
+        end
+    end
+    if unitChecks == 0 then Print("  no visible group units to check") end
     local ids, how = HarmfulIDs("player")
-    Print("highlighting types: " .. (#shown > 0 and table.concat(shown, ", ") or "none")
-        .. " | debuffs the addon can see on you: " .. #ids .. " (" .. how .. ")")
-    local okF, hit = pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, FILTER)
-    Print("game says you have something you can remove: " .. ((okF and hit) and "yes" or "no"))
+    Print("self-only debuffs readable by addon: " .. #ids .. " (" .. how .. ")")
     local count = 0
     pcall(function()
         for i = 1, 40 do
@@ -1505,7 +1517,7 @@ local function Debug()
             Print("  debuff " .. i .. ": " .. tostring(n) .. " - " .. tostring(d))
         end
     end)
-    if count == 0 then Print("  no debuffs on you right now.") end
+    if count == 0 then Print("  no readable harmful auras on you right now (self only).") end
 end
 
 local function SetHidden(hidden)
