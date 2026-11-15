@@ -709,7 +709,6 @@ local function AttachContainer(b)
         local c = CreateFrame("AuraContainer", nil, b, "CustomAuraContainerTemplate")
         c:SetAllPoints(b)
         c:SetFrameLevel(b:GetFrameLevel() + 3)
-        c:SetUnit(b.unit) -- same order as the version where names showed correctly
         pcall(c.EnableMouse, c, false)
 
         local set, key = SlotTypes()
@@ -726,20 +725,6 @@ local function AttachContainer(b)
             pcall(btn.SetMouseClickEnabled, btn, false)
             pcall(btn.SetMouseMotionEnabled, btn, false)
             pcall(btn.EnableMouse, btn, false)
-
-            -- The game's aura slot owns the visibility signal for an
-            -- afflicted row. Nudge the secure click button when that slot
-            -- changes so secure compaction runs for arrivals and removals.
-            btn:HookScript("OnShow", function()
-                SetUnitNameText(b.name, b.unit)
-                b.name:SetTextColor(1, 1, 1)
-                b.name:Show()
-                ShowDispelPopup(b.unit)
-                PlayAlert()
-            end)
-            btn:HookScript("OnHide", function()
-                if db.onlyAfflicted and not b.attached then b.name:Hide() end
-            end)
 
             -- Fill, tinted by the game in the debuff type's colour.
             local fill = btn:CreateTexture(nil, "BACKGROUND")
@@ -769,12 +754,16 @@ local function AttachContainer(b)
             b.slotPulse = { btn = btn, ag = ag, on = db.pulse }
         end
 
-        local ab = c:AddAuraSlot("dispel", db.allTypes and "HARMFUL" or FILTER, {
-            candidateFilters = db.allTypes and { includeDispelTypes = set } or nil,
+        local ab = c:AddAuraSlot("dispel", "HARMFUL", {
+            candidateFilters = { includeDispelTypes = set },
             initializeFrame = init,
         })
         if type(ab) == "table" and not b.auraButton then b.auraButton = ab end
         b.slotFrame = b.slotFrame or b.auraButton
+
+        c:SetUnit(b.unit)
+        c:SetShown(true)
+        c:SetEnabled(true)
 
         pcall(c.UpdateAllAuras, c)
 
@@ -823,8 +812,7 @@ local function UpdateContainers()
         if b.container then
             if b.filterKey ~= key then
                 local ok = pcall(function()
-                    b.container:SetAuraSlotFilterString("dispel", db.allTypes and "HARMFUL" or FILTER)
-                    b.container:SetAuraSlotCandidateFilters("dispel", db.allTypes and { includeDispelTypes = set } or {})
+                    b.container:SetAuraSlotCandidateFilters("dispel", { includeDispelTypes = set })
                 end)
                 if ok then b.filterKey = key end
             end
