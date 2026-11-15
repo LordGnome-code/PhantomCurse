@@ -113,6 +113,7 @@ local DEFAULTS = {
     sound = true,
     popup = true,
     wowLayout = false,
+    showPets = true,
     autoHide = false,
     hideSolo = false,
     classColors = true,
@@ -949,8 +950,7 @@ local function CreateUnitButton(unit, visibility)
     frame:SetFrameRef("pc-click" .. i, click)
     if b.slotFrame then frame:SetFrameRef("pc-slot" .. i, b.slotFrame) end
     click:SetFrameRef("pc-header", frame)
-    SecureHandlerWrapScript(click, "OnShow", frame, STACK)
-    SecureHandlerWrapScript(click, "OnHide", frame, STACK)
+    -- Stable rows avoid moving secure buttons based on restricted aura state.
 
     -- Alert when the game-managed dispel slot appears; this is the combat-safe
     -- signal and requires no addon-side aura inspection.
@@ -975,6 +975,21 @@ local function CreateButtons()
         local unit = "raid" .. i
         local b = CreateUnitButton(unit, "[@" .. unit .. ",exists] show; hide")
         Place(b, math.floor((i - 1) / RAID_ROWS), (i - 1) % RAID_ROWS)
+    end
+    local function PetRow(unit, driver, col, row)
+        local b = CreateUnitButton(unit, db.showPets and driver or "hide")
+        b.petDriver = driver
+        Place(b, col, row)
+    end
+    PetRow("pet", "[group:raid] hide; [@pet,exists] show; hide", 1, 0)
+    for i = 1, 4 do
+        local unit = "partypet" .. i
+        PetRow(unit, "[group:raid] hide; [@" .. unit .. ",exists] show; hide", 1, i)
+    end
+    for i = 1, 40 do
+        local unit = "raidpet" .. i
+        PetRow(unit, "[group:raid,@" .. unit .. ",exists] show; hide",
+            4 + math.floor((i - 1) / RAID_ROWS), (i - 1) % RAID_ROWS)
     end
     frame:SetAttribute("pc-n", #buttons)
     frame:SetAttribute("pc-per", RAID_ROWS)
@@ -1010,6 +1025,7 @@ local function ResizeWindow()
         cols = 1
         rows = math.max(GetNumGroupMembers(), 1)
     end
+    if db.showPets then cols = IsInRaid() and 8 or 2 end
     frame:SetSize(PAD + cols * (BTN_W + PAD), HEADER_H + PAD + rows * (BTN_H + PAD))
 end
 
@@ -1047,6 +1063,11 @@ local function SecureRefresh()
         ApplySpells()
     end
     UpdateContainers()
+    for _, b in ipairs(buttons) do
+        if b.petDriver then
+            RegisterStateDriver(b, "visibility", db.showPets and b.petDriver or "hide")
+        end
+    end
     ResizeWindow()
     frame:SetScale(db.scale or 1)
     ApplyVisibility()
@@ -1184,6 +1205,7 @@ local function BuildSettings()
 
     Check("Show window", "hidden", true)
     Check("WoW window appearance", "wowLayout")
+    Check("Include pets", "showPets")
     Check("Lock position", "locked")
     Check("Hide when out of combat", "autoHide")
     Check("Hide when not in a group", "hideSolo")
