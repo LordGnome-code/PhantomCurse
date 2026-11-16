@@ -555,17 +555,10 @@ local function UpdateButton(b)
     local showRow = true
     b.bg:SetShown(showRow and true or false)
     if b.container and db.onlyAfflicted and b.attached then
-        if b.attached then
-            b.name:Show()
-        else
         -- The aura slot's visibility is controlled by Blizzard and remains
         -- readable to secure OnShow/OnHide handlers during combat. Let those
         -- handlers show the row's name without inspecting aura data here.
-        if not InCombatLockdown() then
-            local slotShown = b.auraButton and b.auraButton:IsShown()
-            b.name:SetShown(slotShown and true or false)
-        end
-        end
+        b.name:Show()
     else
         b.name:SetShown(showRow and true or false)
     end
@@ -804,6 +797,9 @@ end
 local function AttachClick(b)
     if InCombatLockdown() then return end
     local want = b
+    if db.attachClicks and db.onlyAfflicted and b.container and b.auraButton then
+        want = b.auraButton
+    end
     if b.clickParent == want then return end
     if not pcall(b.click.SetParent, b.click, want) then
         want = b
@@ -819,7 +815,7 @@ local function AttachClick(b)
     b.name:SetPoint("RIGHT", b.click, "RIGHT", -4, 0)
     b.name:Show()
     b.click:ClearAllPoints()
-    b.click:SetAllPoints(b)
+    b.click:SetAllPoints(want)
     local okL, lvl = pcall(want.GetFrameLevel, want)
     b.click:SetFrameLevel(((okL and lvl) or b:GetFrameLevel()) + 10)
 end
