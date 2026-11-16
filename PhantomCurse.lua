@@ -1,8 +1,8 @@
--- PhantomCurse: click-to-cleanse window for WoW: Forever (12.x UI engine).
+-- PhantomCurse: dispel-aware group list for WoW: Forever (12.x UI engine).
 --
 -- How it works on this client:
 --  * Each group member gets a secure row with a secure click button that
---    casts your dispel on them. The click button sits INSIDE the game's own
+--    targets that unit for your normal dispel bind. The click button sits INSIDE the game's own
 --    debuff frame for that person, so it only exists (and only takes clicks)
 --    while they have a debuff you can remove. Blank rows are invisible and
 --    clicks pass straight through them.
@@ -286,11 +286,9 @@ header:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
     GameTooltip:AddLine("PhantomCurse")
     if #activeSpells == 0 then
-        GameTooltip:AddLine("No dispel spell found. Clicking targets the player.", 1, 0.5, 0.5, true)
+        GameTooltip:AddLine("Click a row to target that player, then use your dispel bind.", 1, 0.8, 0.5, true)
     else
-        for i, name in ipairs(activeSpells) do
-            GameTooltip:AddDoubleLine(CLICKS[i].label, name, 1, 1, 1, 0.6, 1, 0.6)
-        end
+        GameTooltip:AddLine("Click a row to target that player, then use your dispel bind.", 1, 1, 1, true)
     end
     GameTooltip:AddLine("Drag to move. /pc for commands.", 0.6, 0.6, 0.6)
     GameTooltip:Show()
@@ -801,7 +799,7 @@ local function AttachContainer(b)
         if not reportedContainerError then
             reportedContainerError = true
             Print("Dispel indicator setup failed for " .. b.unit .. ": " .. containerError)
-            Print("Named cleanse buttons remain available. Indicator initialization did not complete.")
+            Print("Secure target rows remain available. Indicator initialization did not complete.")
         end
     end
 end
@@ -948,14 +946,15 @@ local function CreateUnitButton(unit, visibility)
     name:SetWordWrap(false)
     b.name = name
 
-    -- The click button: casts your dispel on this person. It has no
-    -- textures of its own, so it is invisible; AttachClick decides where it
-    -- lives (inside the debuff frame, or on the row).
+    -- The click button securely targets this unit. The player then uses
+    -- their normal dispel bind, which avoids choosing the wrong spell when
+    -- multiple dispel abilities are available.
     local click = CreateFrame("Button", "PhantomCurseButton_" .. unit, b, "SecureActionButtonTemplate")
     click:SetAllPoints(b)
     click:SetFrameLevel(b:GetFrameLevel() + 10)
-    click:RegisterForClicks("AnyUp", "AnyDown")
+    click:RegisterForClicks("AnyUp")
     click:SetAttribute("unit", unit)
+    click:SetAttribute("type1", "target")
     pcall(click.SetMouseMotionEnabled, click, false) -- no hover effects
     b.click = click
 
@@ -1028,15 +1027,10 @@ local function ApplySpells()
     activeSpells = FindSpells()
     BuildCurves()
     for _, b in ipairs(buttons) do
-        local click = b.click
-        for i, c in ipairs(CLICKS) do
-            local name = activeSpells[i]
-            click:SetAttribute(c.prefix .. "type" .. c.suffix, name and "spell" or nil)
-            click:SetAttribute(c.prefix .. "spell" .. c.suffix, name)
-        end
-        if #activeSpells == 0 then
-            click:SetAttribute("type1", "target")
-        end
+        -- Rows only select their unit; casting remains under the player's
+        -- normal keybind so the correct dispel can be chosen deliberately.
+        b.click:SetAttribute("unit", b.unit)
+        b.click:SetAttribute("type1", "target")
     end
 end
 
@@ -1473,12 +1467,12 @@ local function Debug()
         for _, t in ipairs(TYPE_ORDER) do
             if spellTypes[i] and spellTypes[i][t] then types[#types + 1] = t end
         end
-        Print("  " .. CLICKS[i].label .. ": " .. name .. " -> " .. table.concat(types, ", "))
+        Print("  detected dispel " .. name .. " -> " .. table.concat(types, ", "))
     end
     local types = {}
     for t in pairs(canDispel) do types[#types + 1] = t end
     Print("class " .. tostring(playerClass)
-        .. " | spells: " .. (#activeSpells > 0 and table.concat(activeSpells, ", ") or "NONE FOUND")
+        .. " | detected spells: " .. (#activeSpells > 0 and table.concat(activeSpells, ", ") or "NONE FOUND")
         .. " | removes: " .. (#types > 0 and table.concat(types, ", ") or "nothing"))
     Print("game filter " .. (filterOK and "ok" or "rejected")
         .. " | colour curve " .. (curve and "ok" or "missing")
@@ -1647,7 +1641,7 @@ SlashCmdList.PHANTOMCURSE = function(msg)
             Print("no dispel spell found for your class.")
         else
             for i, name in ipairs(activeSpells) do
-                Print(CLICKS[i].label .. ": " .. name)
+        Print("detected dispel: " .. name)
             end
         end
     else

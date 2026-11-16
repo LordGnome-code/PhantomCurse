@@ -1,8 +1,8 @@
 ## Interface: 16001, 120007
 ## Title: PhantomCurse
-## Notes: Click a name to cleanse it. A small decurse window for healers.
+## Notes: Click a name to target it, then use your dispel bind.
 ## Author: You
-## Version: 1.0.1
+## Version: 1.0.2
 ## IconTexture: Interface\Icons\Spell_Holy_DispelMagic
 ## AddonCompartmentFunc: PhantomCurse_OnAddonCompartmentClick
 ## SavedVariables: PhantomCurseDB

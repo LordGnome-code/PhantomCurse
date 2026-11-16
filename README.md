@@ -1,6 +1,6 @@
 # PhantomCurse
 
-A click-to-cleanse window for World of Warcraft: Forever. It lists your group
+A dispel-aware group list for World of Warcraft: Forever. It lists your group
 members and highlights debuffs your character can remove.
 
 ## Install
@@ -17,9 +17,9 @@ Restart the game or use `/reload`, then enable PhantomCurse in the AddOns list.
   The addon also registers this icon in the native Addon Compartment for
   minimap icon-bag addons.
 - Use `/pc minimap` to show or hide the minimap icon.
-- Click a highlighted group member to cast a dispel on them.
-- Left, right, and middle clicks plus Shift + left click can each use a
-  different dispel spell when your class knows more than one.
+- Click a highlighted group member to target them, then use your normal
+  dispel keybind. Keeping the cast on your keybind lets you choose the
+  appropriate ability when your class has more than one dispel.
 - In **Names only when removable** mode, the addon shows players only while
   they have a debuff the game identifies as removable by your character.
   Active rows compact from the top of the window as debuffs appear and clear.
