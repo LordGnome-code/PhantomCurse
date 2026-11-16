@@ -2,7 +2,7 @@
 --
 -- How it works on this client:
 --  * Each group member gets a secure row with a secure click button that
---    targets that unit for your normal dispel bind. The click button sits INSIDE the game's own
+--    targets that unit for your normal dispel bind. The click button sits
 --    debuff frame for that person, so it only exists (and only takes clicks)
 --    while they have a debuff you can remove. Blank rows are invisible and
 --    clicks pass straight through them.
@@ -101,13 +101,6 @@ local TYPE_IDS = { Magic = 1, Curse = 2, Disease = 3, Poison = 4 }
 local TYPE_ORDER = { "Magic", "Curse", "Disease", "Poison" }
 local N_LAYERS = 16
 
-local CLICKS = {
-    { prefix = "",       suffix = "1", label = "Left click" },
-    { prefix = "",       suffix = "2", label = "Right click" },
-    { prefix = "",       suffix = "3", label = "Middle click" },
-    { prefix = "shift-", suffix = "1", label = "Shift + left click" },
-}
-
 local DEFAULTS = {
     locked = false,
     sound = true,
@@ -134,7 +127,7 @@ for k, v in pairs(DEFAULTS) do db[k] = v end
 local buttons, byUnit = {}, {}
 local activeSpells = {}
 local canDispel = {}           -- debuff types your known spells remove
-local spellTypes = {}          -- per click: the debuff types that click's spell removes
+local spellTypes = {}          -- per detected spell: the debuff types it removes
 local playerClass
 local pending = false          -- secure work postponed until combat ends
 local spellsDirty = true       -- spellbook needs rescanning on next secure refresh
@@ -224,7 +217,7 @@ local function FindSpells()
         end
         if castName then
             local idx = seen[castName]
-            if not idx and #found < #CLICKS then
+            if not idx then
                 idx = #found + 1
                 seen[castName] = idx
                 found[idx] = castName
@@ -1631,7 +1624,7 @@ SlashCmdList.PHANTOMCURSE = function(msg)
         else
             db.attachClicks = not db.attachClicks
             SecureRefresh()
-            Print("click buttons inside the debuff frame: " .. (db.attachClicks and "ON (rows stack, blank rows click-through)."
+        Print("click buttons inside the debuff frame: " .. (db.attachClicks and "ON (rows stack, blank rows click-through)."
                 or "OFF (fixed rows, every row clickable)."))
         end
     elseif msg == "debug" then
@@ -1641,7 +1634,7 @@ SlashCmdList.PHANTOMCURSE = function(msg)
             Print("no dispel spell found for your class.")
         else
             for i, name in ipairs(activeSpells) do
-        Print("detected dispel: " .. name)
+                Print("detected dispel: " .. name)
             end
         end
     else
