@@ -100,6 +100,7 @@ local CLASS_SPELLS = {
 local TYPE_IDS = { Magic = 1, Curse = 2, Disease = 3, Poison = 4 }
 local TYPE_ORDER = { "Magic", "Curse", "Disease", "Poison" }
 local N_LAYERS = 16
+local PALADIN_INFECTED_WOUND_IDS = { [3427] = true, [17230] = true, [29306] = true }
 
 local DEFAULTS = {
     locked = false,
@@ -296,7 +297,7 @@ header:SetScript("OnLeave", function() GameTooltip:Hide() end)
 -- all four types rather than silently showing nothing.
 local function Removable(dtype)
     if not TYPE_IDS[dtype] then return false end
-    if db.allTypes or canDispel[dtype] then return true end
+    if db.allTypes or canDispel[dtype] or (playerClass == "PALADIN" and dtype == "Disease") then return true end
     return next(canDispel) == nil and CLASS_SPELLS[playerClass] ~= nil
 end
 
@@ -328,10 +329,10 @@ local function BuildCurves()
     maskCurve = MakeCurve(true)
 end
 
--- Candidate types for the game-managed AuraContainer slot. Let Blizzard's
--- RAID_PLAYER_DISPELLABLE filter confirm what this character can actually
--- remove, but include Paladin diseases even if its spellbook scan missed the
--- learned Purify/Cleanse variant.
+-- Candidate filters for the game-managed AuraContainer slot. Paladins can
+-- remove diseases with Purify/Cleanse; include Disease even if the spellbook
+-- scan misses the learned variant. Include known Infected Wound spell IDs too,
+-- since that debuff has used more than one ID across client versions.
 local function SlotTypes()
     local set, key = {}, ""
     for _, dtype in ipairs(TYPE_ORDER) do
@@ -341,6 +342,16 @@ local function SlotTypes()
         end
     end
     return set, key
+end
+
+local function SlotFilters()
+    local set, key = SlotTypes()
+    local filters = { includeDispelTypes = set }
+    if playerClass == "PALADIN" then
+        filters.includeSpellIDs = PALADIN_INFECTED_WOUND_IDS
+        key = key .. ":infected-wound"
+    end
+    return filters, key
 end
 
 -- Returns a debuff on the unit that your class can remove, or nil.
@@ -357,7 +368,10 @@ local function FindDispellable(unit)
             local aura = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
             if not aura then return nil end
             local dtype = aura.dispelName
-            if dtype and not issecret(dtype) and Removable(dtype) then
+            local spellID = aura.spellId
+            local infectedWound = playerClass == "PALADIN"
+                and spellID and not issecret(spellID) and PALADIN_INFECTED_WOUND_IDS[spellID]
+            if infectedWound or (dtype and not issecret(dtype) and Removable(dtype)) then
                 return aura
             end
         end
@@ -706,8 +720,7 @@ local function AttachContainer(b)
         c:SetFrameLevel(b:GetFrameLevel() + 3)
         pcall(c.EnableMouse, c, false)
 
-        local set, key = SlotTypes()
-        local filter = db.allTypes and "HARMFUL" or FILTER
+        local candidates, key = SlotFilters()
         local styles = Enum and Enum.CustomAuraButtonDispelTypeTextureStyle
         local preserve = styles and styles.PreserveAsset or 3
 
@@ -767,8 +780,8 @@ local function AttachContainer(b)
             b.slotPulse = { btn = btn, ag = ag, on = db.pulse }
         end
 
-        local ab = c:AddAuraSlot("dispel", filter, {
-            candidateFilters = { includeDispelTypes = set },
+        local ab = c:AddAuraSlot("dispel", "HARMFUL", {
+            candidateFilters = candidates,
             initializeFrame = init,
         })
         if type(ab) == "table" and not b.auraButton then b.auraButton = ab end
@@ -782,7 +795,6 @@ local function AttachContainer(b)
 
         b.container = c
         b.filterKey = key
-        b.filterString = filter
     end)
     if not ok then
         b.container = nil
@@ -828,21 +840,14 @@ end
 -- Keeps the game-drawn highlight in step with your spells and settings.
 -- Out of combat only.
 local function UpdateContainers()
-    local set, key = SlotTypes()
-    local filter = db.allTypes and "HARMFUL" or FILTER
+    local candidates, key = SlotFilters()
     for _, b in ipairs(buttons) do
         if b.container then
             if b.filterKey ~= key then
                 local ok = pcall(function()
-                    b.container:SetAuraSlotCandidateFilters("dispel", { includeDispelTypes = set })
+                    b.container:SetAuraSlotCandidateFilters("dispel", candidates)
                 end)
                 if ok then b.filterKey = key end
-            end
-            if b.filterString ~= filter then
-                local ok = pcall(function()
-                    b.container:SetAuraSlotFilterString("dispel", filter)
-                end)
-                if ok then b.filterString = filter end
             end
             local pulse = b.slotPulse
             if pulse and pulse.on ~= db.pulse then
