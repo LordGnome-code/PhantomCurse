@@ -20,9 +20,9 @@ Restart the game or use `/reload`, then enable PhantomCurse in the AddOns list.
 - Click a highlighted group member to target them, then use your normal
   dispel keybind. Keeping the cast on your keybind lets you choose the
   appropriate ability when your class has more than one dispel.
-- In **Names only when removable** mode, the addon shows players only while
-  they have a debuff the game identifies as removable by your character.
-  Active rows compact from the top of the window as debuffs appear and clear.
+- In **Compact: removable names** mode, rows without a removable debuff are
+  hidden while aura data is readable. If combat protection prevents a reliable
+  check, the full roster stays visible so you can still select a target.
 - Switch to **Names always shown** from `/pc mode` or the settings window.
 - Shows a brief on-screen popup when the game-managed dispel slot appears. The
   popup can be disabled in settings; the alert sound has its own setting.
@@ -44,7 +44,6 @@ Restart the game or use `/reload`, then enable PhantomCurse in the AddOns list.
 | `/pc spells` | List detected dispel spells |
 | `/pc version` | Show addon and game version details |
 | `/pc debug`, `/pc why` | Print diagnostic information |
-| `/pc attach` | Toggle click-through empty rows when supported |
 
 ## Settings
 
@@ -59,7 +58,6 @@ The client writes SavedVariables on logout or `/reload`.
 ## Compatibility
 
 The addon uses the game's dispel-aware aura filtering and secure click buttons
-to support combat lockdown. Some display and click-through behavior depends on
-the client's `AuraContainer` and secure-frame support. Use `/pc debug` or
-`/pc why` for diagnostics if the highlight or row stacking does not appear as
-expected.
+to support combat lockdown. AuraContainer drives the game-drawn highlight;
+readable aura data and an addon-drawn highlight provide fallback detection.
+Use `/pc debug` or `/pc why` if the highlight does not appear as expected.

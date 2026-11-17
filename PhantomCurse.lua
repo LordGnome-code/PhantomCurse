@@ -1,22 +1,14 @@
 -- PhantomCurse: dispel-aware group list for WoW: Forever (12.x UI engine).
 --
 -- How it works on this client:
---  * Each group member gets a secure row with a secure click button that
---    targets that unit for your normal dispel bind. The click button sits
---    debuff frame for that person, so it only exists (and only takes clicks)
---    while they have a debuff you can remove. Blank rows are invisible and
---    clicks pass straight through them.
---  * A secure snippet (which the game runs even in combat) restacks the rows
---    whenever a click button appears or disappears: rows with a name go to
---    the top, one under the other. The addon never reads who is debuffed.
+--  * Each group member gets a fixed row and secure click button targeting
+--    that unit. Compact mode hides rows only when aura data is readable and
+--    no removable aura was found.
 --  * The window's own visibility (closed, hide out of combat, hide when solo)
 --    is also a state driver, so it can appear the instant combat starts.
---  * In combat the client hides all aura data from addon code ("secret
---    values"), so an addon cannot see who has which debuff. The highlight is
---    therefore drawn by the game itself: every row holds an AuraContainer
---    with aura slots that only accept debuffs of the types your dispels
---    remove. The game shows a slot the moment a matching debuff lands and
---    hides it when it is gone, in or out of combat.
+--  * In combat, aura data can be protected from addon code. Each row holds an
+--    AuraContainer with aura slots accepting the types your dispels remove.
+--    A readable-data scan and addon-drawn highlight provide fallback behavior.
 --  * Addon-side detection (reading debuff types directly) still runs for the
 --    alert sound, and as a fallback on clients without AuraContainer.
 
@@ -114,8 +106,7 @@ local DEFAULTS = {
     pulse = true,
     hidden = false,
     allTypes = false,          -- highlight every typed debuff, removable or not
-    onlyAfflicted = true,      -- Decursive-style: names only when removable
-    attachClicks = true,       -- click buttons inside the game's debuff frame (stacking + click-through)
+    onlyAfflicted = true,      -- compact roster when aura data can be read
     scale = 1,
     alpha = 0.85,
     showMinimap = true,
@@ -346,12 +337,7 @@ end
 
 local function SlotFilters()
     local set, key = SlotTypes()
-    local filters = { includeDispelTypes = set }
-    if playerClass == "PALADIN" then
-        filters.includeSpellIDs = PALADIN_INFECTED_WOUND_IDS
-        key = key .. ":infected-wound"
-    end
-    return filters, key
+    return { includeDispelTypes = set }, key
 end
 
 -- Returns a debuff on the unit that your class can remove, or nil.
@@ -521,10 +507,8 @@ local function ShowDispelPopup(unit)
     end)
 end
 
--- Draws the parts of a row the addon itself controls: the name in "names
--- always shown" mode, the test highlight, and the fallback highlight on
--- clients without the game-drawn one. The game-drawn highlight needs none of
--- this: the game shows and hides it by itself, in or out of combat.
+-- Draws the readable-data highlight and applies row visibility. AuraContainer
+-- remains an independent game-drawn highlight path.
 local function UpdateButton(b)
     -- Rows the game has hidden (party rows in a raid, empty raid slots, or
     -- the whole window) are skipped; OnShow refreshes them when they return.
@@ -541,15 +525,23 @@ local function UpdateButton(b)
     b.name:SetFormattedText("%s", text)
     b.name:Show()
 
-    -- Rows with the game-drawn highlight don't need the addon's own scan.
+    -- Keep the readable-data scan as a fallback even when AuraContainer was
+    -- created. Some client builds create the container but fail to match a
+    -- candidate; outside combat this scan can still identify the dispel.
     local aura
-    if not b.container then
+    local auraReadable = not InCombatLockdown()
+    if auraReadable or not b.container then
         local ok, found = pcall(FindDispellable, unit)
-        if ok then aura = found end
+        if ok then aura = found else auraReadable = false end
     end
     local testing = b.testUntil and GetTime() < b.testUntil
-    local detected = testing or (not b.container and aura)
+    local detected = testing or aura
     local layered = false
+    local slotVisible = false
+    if b.auraButton then
+        local okSlot, shown = pcall(b.auraButton.IsVisible, b.auraButton)
+        slotVisible = okSlot and shown and true or false
+    end
 
     -- Fallback rows only; game-drawn rows play the sound from their click button.
     if not b.container then
@@ -569,7 +561,8 @@ local function UpdateButton(b)
     else
         b.glow:Hide()
         SetEdges(b, false)
-        layered = not b.container and UpdateLayers(b, unit, text)
+        if slotVisible then HideLayers(b)
+        else layered = UpdateLayers(b, unit, text) end
         local _, class = UnitClass(unit)
         local cc = db.classColors and class and not issecret(class)
             and RAID_CLASS_COLORS and RAID_CLASS_COLORS[class]
@@ -580,17 +573,14 @@ local function UpdateButton(b)
         end
     end
 
-    -- Display mode: in "only when removable" the row is blank unless afflicted.
-    local showRow = true
+    -- Aura values can be hidden in combat. If the game slot cannot provide a
+    -- readable match, keep the roster visible instead of hiding every row.
+    local showRow = not db.onlyAfflicted or detected or slotVisible or layered or not auraReadable
     b.bg:SetShown(showRow and true or false)
-    if b.container and db.onlyAfflicted and b.attached then
-        -- The aura slot's visibility is controlled by Blizzard and remains
-        -- readable to secure OnShow/OnHide handlers during combat. Let those
-        -- handlers show the row's name without inspecting aura data here.
-        b.name:Show()
-    else
-        b.name:SetShown(showRow and true or false)
-    end
+    -- Keep names in the ordinary row frame. The game can hide its AuraButton
+    -- when filtering fails or aura values are protected; a hidden slot must
+    -- never make the whole group list disappear.
+    b.name:SetShown(showRow and true or false)
 
     if (detected or layered) and db.pulse then
         if not b.pulse:IsPlaying() then b.pulse:Play() end
@@ -658,22 +648,10 @@ local function MarkAllDirty()
 end
 
 ---------------------------------------------------------------------------
--- Rows, click buttons and stacking
+-- Rows and click buttons
 ---------------------------------------------------------------------------
--- Each group member has:
---  * a row: a secure frame, so a secure snippet may move it even in combat;
---  * an AuraContainer on the row: the game shows its debuff frame only while
---    that person has a debuff you can remove, and draws the highlight in it;
---  * a click button (secure) placed INSIDE that debuff frame. A frame inside
---    a hidden frame is hidden too, so the click button only exists while the
---    debuff does. With no debuff there is nothing there to click: the row is
---    invisible and clicks go straight through to the world.
---
--- Stacking: the game runs the STACK snippet whenever a click button appears
--- or disappears (in combat too). It moves every row whose click button is
--- showing to the top of the list, one under the other, in group order.
--- The addon never reads who has a debuff; it only reacts to the game showing
--- or hiding its own frame.
+-- Each group member has a fixed row, a secure click button covering the full
+-- row, and an AuraContainer for the game-drawn dispel highlight.
 
 local function Place(b, col, row)
     b:ClearAllPoints()
@@ -681,33 +659,6 @@ local function Place(b, col, row)
         PAD + col * (BTN_W + PAD),
         -(HEADER_H + PAD + row * (BTN_H + PAD)))
 end
-
-local STACK = [[
-    local header = self:GetFrameRef("pc-header")
-    if not header then return end
-    local n = header:GetAttribute("pc-n") or 0
-    local per = header:GetAttribute("pc-per") or 10
-    local w = header:GetAttribute("pc-w") or 120
-    local h = header:GetAttribute("pc-h") or 18
-    local pad = header:GetAttribute("pc-pad") or 2
-    local top = header:GetAttribute("pc-top") or 16
-    local col, r = 0, 0
-    for i = 1, n do
-        local row = header:GetFrameRef("pc-row" .. i)
-        local click = header:GetFrameRef("pc-click" .. i)
-        local slot = header:GetFrameRef("pc-slot" .. i)
-        if row and click and ((slot and slot:IsVisible()) or (not slot and click:IsVisible())) then
-            row:ClearAllPoints()
-            row:SetPoint("TOPLEFT", header, "TOPLEFT",
-                pad + col * (w + pad), -(top + pad + r * (h + pad)))
-            r = r + 1
-            if r >= per then
-                r = 0
-                col = col + 1
-            end
-        end
-    end
-]]
 
 -- Builds the game-drawn highlight for one row: an AuraContainer watching the
 -- row's unit with one debuff slot. Everything drawn inside the slot's frame
@@ -731,8 +682,7 @@ local function AttachContainer(b)
             btn:SetPoint("CENTER", b, "CENTER", 0, 0)
             btn:SetSize(BTN_W, BTN_H)
             btn:SetFrameLevel(b:GetFrameLevel() + 4)
-            -- The debuff frame itself never takes the mouse; the click button
-            -- inside it does.
+            -- The row's secure click button handles targeting.
             pcall(btn.SetMouseClickEnabled, btn, false)
             pcall(btn.SetMouseMotionEnabled, btn, false)
             pcall(btn.EnableMouse, btn, false)
@@ -807,30 +757,20 @@ local function AttachContainer(b)
     end
 end
 
--- Puts the click button inside the debuff frame ("names only when
--- removable"), or on the row itself ("names always shown", or when the
--- debuff frame isn't available). Out of combat only: secure buttons can't
+-- Keeps the click button on the row. Out of combat only: secure buttons can't
 -- be re-parented in combat.
 local function AttachClick(b)
     if InCombatLockdown() then return end
+    -- Keep target selection on the full row. AuraButton visibility can fail
+    -- to update on some clients, which otherwise removes every usable row.
     local want = b
-    if db.attachClicks and db.onlyAfflicted and b.container and b.auraButton then
-        want = b.auraButton
-    end
     if b.clickParent == want then return end
     if not pcall(b.click.SetParent, b.click, want) then
         want = b
         b.click:SetParent(b)
     end
     b.clickParent = want
-    b.attached = want ~= b
-    -- Configure the label before combat. Parent visibility then controls it
-    -- together with the secure cast button, without combat-time mutations.
-    b.name:SetParent(b.click)
-    b.name:ClearAllPoints()
-    b.name:SetPoint("LEFT", b.click, "LEFT", 4, 0)
-    b.name:SetPoint("RIGHT", b.click, "RIGHT", -4, 0)
-    b.name:Show()
+    -- Keep the secure click target and name on the full row.
     b.click:ClearAllPoints()
     b.click:SetAllPoints(want)
     local okL, lvl = pcall(want.GetFrameLevel, want)
@@ -973,29 +913,11 @@ local function CreateUnitButton(unit, visibility)
     buttons[#buttons + 1] = b
     byUnit[unit] = b
 
-    -- Stacking: the game runs STACK whenever this click button appears or
-    -- disappears, in or out of combat.
-    local i = #buttons
-    frame:SetFrameRef("pc-row" .. i, b)
-    frame:SetFrameRef("pc-click" .. i, click)
-    if b.slotFrame then frame:SetFrameRef("pc-slot" .. i, b.slotFrame) end
-    click:SetFrameRef("pc-header", frame)
-    -- Stable rows avoid moving secure buttons based on restricted aura state.
-
-    -- Alert when the game-managed dispel slot appears; this is the combat-safe
-    -- signal and requires no addon-side aura inspection.
-    click:HookScript("OnShow", function()
-        if b.attached and not b.auraButton then
-            ShowDispelPopup(b.unit)
-            PlayAlert()
-        end
-    end)
     return b
 end
 
 local function CreateButtons()
-    -- Starting spots. Rows with a name showing are restacked from the top by
-    -- STACK; rows without one show nothing wherever they sit.
+    -- Place the fixed roster into the available columns.
     Place(CreateUnitButton("player", "[group:raid] hide; show"), 0, 0)
     for i = 1, 4 do
         local unit = "party" .. i
@@ -1021,12 +943,6 @@ local function CreateButtons()
         PetRow(unit, "[group:raid,@" .. unit .. ",exists] show; hide",
             4 + math.floor((i - 1) / RAID_ROWS), (i - 1) % RAID_ROWS)
     end
-    frame:SetAttribute("pc-n", #buttons)
-    frame:SetAttribute("pc-per", RAID_ROWS)
-    frame:SetAttribute("pc-w", BTN_W)
-    frame:SetAttribute("pc-h", BTN_H)
-    frame:SetAttribute("pc-pad", PAD)
-    frame:SetAttribute("pc-top", HEADER_H)
 end
 
 local function ApplySpells()
@@ -1249,7 +1165,7 @@ local function BuildSettings()
     mode:SetSize(222, 22)
     mode:SetPoint("TOPLEFT", 12, y)
     mode.Refresh = function()
-        mode:SetText(db.onlyAfflicted and "Names only when removable" or "Names always shown")
+        mode:SetText(db.onlyAfflicted and "Compact: removable names" or "Names always shown")
     end
     mode:SetScript("OnClick", function()
         db.onlyAfflicted = not db.onlyAfflicted
@@ -1392,8 +1308,7 @@ cog:SetScript("OnLeave", function() GameTooltip:Hide() end)
 ---------------------------------------------------------------------------
 -- Slash commands
 ---------------------------------------------------------------------------
--- /pc why: run it while a name is lit (and, to check clicking, with the
--- mouse resting on that name). Reports why stacking or clicking isn't working.
+-- /pc why: report visible rows and which frame is under the mouse.
 local function MouseState(f)
     local okC, c = pcall(f.IsMouseClickEnabled, f)
     local okM, m = pcall(f.IsMouseMotionEnabled, f)
@@ -1402,32 +1317,25 @@ end
 
 local function Why()
     Print("--- why (in combat: " .. tostring(InCombatLockdown() and true or false) .. ") ---")
-    local attached, shownRows, lit = 0, 0, 0
+    local shownRows = 0
     local fTop = frame:GetTop()
     for _, b in ipairs(buttons) do
-        if b.attached then attached = attached + 1 end
         if b:IsVisible() then
             shownRows = shownRows + 1
             local okV, vis = pcall(b.click.IsVisible, b.click)
-            if okV and vis and b.attached then
-                lit = lit + 1
+            if okV and vis then
                 local row = "?"
                 local okT, bTop = pcall(b.GetTop, b)
                 if okT and bTop and fTop then
                     row = tostring(math.floor((fTop - HEADER_H - PAD - bTop) / (BTN_H + PAD) + 0.5) + 1)
                 end
                 local display = issecret(b.displayName) and "(protected name displayed by client)" or tostring(b.displayName or b.unit)
-                Print("  lit: " .. display .. " (" .. b.unit .. ") in row " .. row
+                Print("  visible: " .. display .. " (" .. b.unit .. ") in row " .. row
                     .. " | click button " .. MouseState(b.click))
             end
         end
     end
-    Print("rows for your group: " .. shownRows .. " | lit: " .. lit
-        .. " | click buttons inside the debuff frame: " .. attached .. " of " .. #buttons)
-    if attached == 0 then
-        Print("  -> the game didn't allow putting click buttons inside its debuff frame;"
-            .. " every row stays clickable instead.")
-    end
+    Print("visible rows: " .. shownRows .. " | each row targets its unit when clicked")
     local foci = {}
     if GetMouseFoci then
         local ok, list = pcall(function() return { GetMouseFoci() } end)
@@ -1625,21 +1533,12 @@ SlashCmdList.PHANTOMCURSE = function(msg)
         db.onlyAfflicted = not db.onlyAfflicted
         ApplySettings()
         if settings then settings.mode.Refresh() end
-        Print("display mode: " .. (db.onlyAfflicted and "names only when removable." or "names always shown."))
+        Print("display mode: " .. (db.onlyAfflicted and "compact names." or "names always shown."))
     elseif msg == "version" then
         local v1, v2, v3 = VersionInfo()
         Print(v1 .. " | " .. v2 .. " | " .. v3)
     elseif msg == "why" then
         Why()
-    elseif msg == "attach" then
-        if InCombatLockdown() then
-            Print("can't change that in combat.")
-        else
-            db.attachClicks = not db.attachClicks
-            SecureRefresh()
-        Print("click buttons inside the debuff frame: " .. (db.attachClicks and "ON (rows stack, blank rows click-through)."
-                or "OFF (fixed rows, every row clickable)."))
-        end
     elseif msg == "debug" then
         Debug()
     elseif msg == "spells" then
@@ -1651,7 +1550,7 @@ SlashCmdList.PHANTOMCURSE = function(msg)
             end
         end
     else
-        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | minimap | test | spells | version | debug | why | attach")
+        Print("commands: /pc config | show | hide | toggle | lock | sound | combat | mode | reset | minimap | test | spells | version | debug | why")
     end
 end
 
